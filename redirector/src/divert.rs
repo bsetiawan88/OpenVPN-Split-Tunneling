@@ -201,7 +201,18 @@ struct TcpFlow {
     /// while a2r==0 means the app never sent anything (app-side abort).
     a2r_bytes: u64,
     r2a_bytes: u64,
+    /// Server→app bytes that did not fit smoltcp's window yet. Retried when
+    /// can_send() reopens. Dropping these (as the old code did on partial
+    /// send_slice) truncates responses mid-TLS-record: the app's TLS stack
+    /// aborts the session and reports "other side closed". Bounded (cap
+    /// below) so a never-reading app can't grow it without limit.
+    r2a_pending: Vec<u8>,
 }
+
+/// Server→app staging cap. Past this, messages wait in the (bounded)
+/// channel instead — which correctly back-pressures the server via the
+/// bridge socket's receive window.
+const R2A_PENDING_CAP: usize = 256 * 1024;
 
 enum TcpState {
     Pending,
@@ -494,6 +505,7 @@ fn handle_capture(
                     last_active: Instant::now(),
                     a2r_bytes: 0,
                     r2a_bytes: 0,
+                    r2a_pending: Vec::new(),
                 },
             );
         }
@@ -667,10 +679,11 @@ fn service_tcp_flows(
             }
             TcpState::Bridging { app_to_remote, remote_to_app, app_half_closed } => {
                 let socket = sockets.get_mut::<tcp::Socket>(flow.handle);
-                // Remote leg gone AND its tail bytes drained (closed but
-                // non-empty still has data for the app): FIN our side so the
-                // app sees a clean close instead of hanging, then retire.
-                if remote_to_app.is_closed() && remote_to_app.is_empty() {
+                // Remote leg gone, its tail bytes drained, AND staged bytes
+                // flushed (pending non-empty still has data for the app):
+                // FIN our side so the app sees a clean close instead of
+                // hanging, then retire.
+                if remote_to_app.is_closed() && remote_to_app.is_empty() && flow.r2a_pending.is_empty() {
                     // Remote leg gone (outbound connect failed, or remote EOF
                     // with the write leg drained): summary first, then FIN
                     // our side so the app sees a clean close.
@@ -684,9 +697,22 @@ fn service_tcp_flows(
                         moved_bytes += n;
                         flow.a2r_bytes += n;
                     }
-                    let n = pump_tcp_remote_to_app(socket, remote_to_app, flow.pid, stats);
+                    let pend_before = flow.r2a_pending.len();
+                    let n = pump_tcp_remote_to_app(
+                        socket,
+                        remote_to_app,
+                        &mut flow.r2a_pending,
+                        flow.pid,
+                        stats,
+                    );
                     moved_bytes += n;
                     flow.r2a_bytes += n;
+                    // Staged-but-unflushed bytes are progress too: without
+                    // this, a half-closed app whose window momentarily shuts
+                    // could hit the 120s idle timeout and discard live data.
+                    if flow.r2a_pending.len() > pend_before {
+                        flow.last_active = now;
+                    }
                     if moved_bytes > 0 {
                         flow.last_active = now;
                     }
@@ -817,36 +843,47 @@ fn pump_tcp_app_to_remote(
     moved
 }
 
+/// Moves server bytes into the app socket. Lossless: channel messages stage
+/// into `pending` and partial window writes keep their remainder there for
+/// the next poll — nothing is dropped between the channel and the socket.
+/// `moved` counts bytes actually accepted by smoltcp (feeds flow counters
+/// and the GC clock).
 fn pump_tcp_remote_to_app(
     socket: &mut tcp::Socket,
     receiver: &mut mpsc::Receiver<Vec<u8>>,
+    pending: &mut Vec<u8>,
     pid: u32,
     stats: &Stats,
 ) -> u64 {
-    let mut moved = 0u64;
-    while socket.can_send() {
+    // Stage new arrivals while bounded; overflow waits in the channel (which
+    // back-pressures the server through the bridge socket's window).
+    while pending.len() < R2A_PENDING_CAP {
         match receiver.try_recv() {
-            Ok(data) => {
-                let mut written = 0;
-                while written < data.len() {
-                    match socket.send_slice(&data[written..]) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            written += n;
-                            stats.add_remote_to_app(n as u64);
-                            stats.add_pid_in(pid, n as u64);
-                        }
-                        Err(_) => return moved,
-                    }
-                }
-                moved += written as u64;
-            }
+            Ok(data) => pending.extend_from_slice(&data),
             Err(mpsc::error::TryRecvError::Empty) => break,
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                socket.close();
-                break;
-            }
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
         }
+    }
+    // Flush staged bytes while the socket has window.
+    let mut moved = 0u64;
+    while !pending.is_empty() && socket.can_send() {
+        match socket.send_slice(pending) {
+            Ok(0) => break,
+            Ok(n) => {
+                pending.drain(..n);
+                moved += n as u64;
+                stats.add_remote_to_app(n as u64);
+                stats.add_pid_in(pid, n as u64);
+            }
+            Err(_) => break,
+        }
+    }
+    // Bridge task gone (sender dropped): close our side, but ONLY once
+    // staged bytes are fully flushed — closing early would truncate the
+    // tail (the exact bug this buffer exists to fix). The caller gates
+    // retirement on the same drained condition.
+    if receiver.is_closed() && receiver.is_empty() && pending.is_empty() {
+        socket.close();
     }
     moved
 }
