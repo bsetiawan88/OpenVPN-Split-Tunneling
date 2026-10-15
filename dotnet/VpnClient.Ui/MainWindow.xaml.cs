@@ -22,6 +22,7 @@ public partial class MainWindow : FluentWindow
     private bool _watchdogFiring;
     private string _connectorStatus = "";
     private DispatcherTimer? _rotateTimer;
+    private DispatcherTimer? _ovpnLogTimer;
 
     private static readonly int[] RotateChoices = { 5, 10, 15, 30, 60, 120, 180, 360 };
 
@@ -38,6 +39,9 @@ public partial class MainWindow : FluentWindow
             InitRotateControls();
             InitLogPanel();
             _statusClient.Start();
+            _ovpnLogTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+            _ovpnLogTimer.Tick += (_, _) => RefreshOvpnLogIfVisible();
+            _ovpnLogTimer.Start();
             RefreshAppList();
             UpdateConnectButtonState(false);
             UpdateRotateHint();
@@ -45,6 +49,7 @@ public partial class MainWindow : FluentWindow
         Closed += (_, _) =>
         {
             _rotateTimer?.Stop();
+            _ovpnLogTimer?.Stop();
             _statusClient.Stop();
         };
     }
@@ -234,12 +239,6 @@ public partial class MainWindow : FluentWindow
         settings.ShowDialog();
     }
 
-    private void LogBtn_Click(object sender, RoutedEventArgs e)
-    {
-        var log = new LogWindow { Owner = this };
-        log.Show();
-    }
-
     /// <summary>
     /// Connected profile name under the egress IP. Prefers the live
     /// connector profile, falls back to the configured active one.
@@ -299,12 +298,13 @@ public partial class MainWindow : FluentWindow
             }
             else
             {
-                var profile = ResolveActiveProfile();
-                ConnectBtn.ToolTip = profile is null
-                    ? "Connect"
-                    : $"Connect using \"{profile.DisplayName}\"";
+                ConnectBtn.ToolTip = "Connect using a random profile";
             }
         }
+        RotateNowBtn.IsEnabled = App.Connector.WantConnected;
+        RotateNowBtn.ToolTip = App.Connector.WantConnected
+            ? "Switch to a random profile now"
+            : "Connect first, then rotate";
     }
 
     private OvpnEntry? ResolveActiveProfile()
@@ -315,6 +315,26 @@ public partial class MainWindow : FluentWindow
             if (active is not null) return active;
         }
         return _config.OvpnFiles.FirstOrDefault();
+    }
+
+    /// <summary>A profile is connectable when its file exists and any
+    /// required credentials are already saved.</summary>
+    private static bool IsConnectable(OvpnEntry p) =>
+        System.IO.File.Exists(p.FilePath)
+        && (!OvpnParser.NeedsUiCredentials(p.FilePath)
+            || (!string.IsNullOrWhiteSpace(p.Username) && !string.IsNullOrWhiteSpace(p.GetPassword())));
+
+    /// <summary>
+    /// Random connectable profile. Falls back to any profile (so the user
+    /// still gets the meaningful missing-file/credentials error) and null
+    /// when nothing exists at all.
+    /// </summary>
+    private OvpnEntry? PickRandomProfile()
+    {
+        var pool = _config.OvpnFiles.Where(IsConnectable).ToList();
+        if (pool.Count == 0) pool = _config.OvpnFiles.ToList();
+        if (pool.Count == 0) return null;
+        return pool[Random.Shared.Next(pool.Count)];
     }
 
     private async void ConnectBtn_Click(object sender, RoutedEventArgs e)
@@ -346,7 +366,7 @@ public partial class MainWindow : FluentWindow
         }
 
         _config.RefreshFromDisk();
-        var profile = ResolveActiveProfile();
+        var profile = PickRandomProfile();
         if (profile is null)
         {
             System.Windows.MessageBox.Show(
@@ -384,6 +404,8 @@ public partial class MainWindow : FluentWindow
 
         _connecting = true;
         _vpnDownSince = DateTime.UtcNow;
+        _config.ActiveOvpnId = profile.Id;
+        _config.Save();
         StateSpinner.Visibility = Visibility.Visible;
         StateDot.Visibility = Visibility.Collapsed;
         StateText.Text = "Connecting…";
@@ -460,6 +482,67 @@ public partial class MainWindow : FluentWindow
     {
         _logLines.Clear();
         LogText.Text = string.Empty;
+    }
+
+    private void CopyActivityBtn_Click(object sender, RoutedEventArgs e)
+    {
+        if (string.IsNullOrEmpty(LogText.Text))
+        {
+            FooterText.Text = "Nothing to copy — activity log is empty";
+            return;
+        }
+        try
+        {
+            System.Windows.Clipboard.SetText(LogText.Text);
+            FooterText.Text = "Activity log copied to clipboard";
+        }
+        catch (Exception ex)
+        {
+            FooterText.Text = $"Copy failed: {ex.Message}";
+        }
+    }
+
+    private void RefreshOvpnLogBtn_Click(object sender, RoutedEventArgs e) => RefreshOvpnLogNow();
+
+    private void CopyOvpnLogBtn_Click(object sender, RoutedEventArgs e)
+    {
+        if (string.IsNullOrEmpty(OpenVpnLogText.Text))
+        {
+            FooterText.Text = "Nothing to copy — OpenVPN log is empty";
+            return;
+        }
+        try
+        {
+            System.Windows.Clipboard.SetText(OpenVpnLogText.Text);
+            FooterText.Text = "OpenVPN log copied to clipboard";
+        }
+        catch (Exception ex)
+        {
+            FooterText.Text = $"Copy failed: {ex.Message}";
+        }
+    }
+
+    private void LogTabs_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        // Ignore bubbled SelectionChanged from nested controls (if any) —
+        // only the tab strip itself triggers a refresh.
+        if (!ReferenceEquals(e.Source, LogTabs)) return;
+        // Refresh immediately when the user opens the OpenVPN tab instead of
+        // waiting for the next 2s timer tick.
+        if (OpenVpnTab?.IsSelected == true)
+            RefreshOvpnLogNow();
+    }
+
+    private void RefreshOvpnLogIfVisible()
+    {
+        if (LogPanel.Visibility != Visibility.Visible) return;
+        if (OpenVpnTab?.IsSelected != true) return;
+        RefreshOvpnLogNow();
+    }
+
+    private void RefreshOvpnLogNow()
+    {
+        OpenVpnLogText.Text = VpnConnector.ReadLogTail(400);
     }
 
     private void OnLogEvent(object? sender, Vpnclient.Status.Event e)
@@ -576,10 +659,7 @@ public partial class MainWindow : FluentWindow
             for (int i = 1; i <= _config.OvpnFiles.Count; i++)
             {
                 var cand = _config.OvpnFiles[(start + i + _config.OvpnFiles.Count) % _config.OvpnFiles.Count];
-                if (!System.IO.File.Exists(cand.FilePath)) continue;
-                if (OvpnParser.NeedsUiCredentials(cand.FilePath)
-                    && (string.IsNullOrWhiteSpace(cand.Username) || string.IsNullOrWhiteSpace(cand.GetPassword())))
-                    continue;
+                if (!IsConnectable(cand)) continue;
                 next = cand;
                 break;
             }
@@ -590,77 +670,115 @@ public partial class MainWindow : FluentWindow
             }
             if (next.Id == liveId) return; // only ourselves connectable
 
-            var prevId = liveId;
-            try
-            {
-                FooterText.Text = $"Rotating to \"{next.DisplayName}\"…";
-                var dc = App.Connector.DisconnectCount;
-                await App.Connector.DisconnectAsync();
-                // A manual Disconnect interleaved with our own (user hit
-                // Disconnect/Cancel while we awaited) must NOT be
-                // resurrected by the Connect below.
-                if (App.Connector.DisconnectCount != dc + 1) return;
-                _config.ActiveOvpnId = next.Id;
-                _config.Save();
-                await App.Connector.ConnectAsync(next);
-                if (!App.Connector.WantConnected)
-                {
-                    // Stopped while connecting — leave it stopped.
-                    _connecting = false;
-                    _vpnDownSince = null;
-                    return;
-                }
-                _connecting = true;
-                _vpnDownSince = DateTime.UtcNow;
-            }
-            catch (Exception ex)
-            {
-                // A concurrent manual Disconnect (WantConnected==false) wins:
-                // do not restore anything, leave the tunnel stopped.
-                if (!App.Connector.WantConnected)
-                {
-                    _connecting = false;
-                    _vpnDownSince = null;
-                    return;
-                }
-                // Never leave the tunnel dead after a failed rotate: fall
-                // back to the previous profile (WantConnected stays true
-                // either way so the watchdog keeps repairing).
-                FooterText.Text = $"Rotate to \"{next.DisplayName}\" failed: {ex.Message} — restoring previous";
-                // Same interleave guard as above: a manual Disconnect during
-                // the restore connect must win — honor it instead of leaving
-                // a resurrected tunnel behind.
-                try
-                {
-                    var prev = _config.OvpnFiles.FirstOrDefault(p => p.Id == prevId);
-                    if (prev is not null && System.IO.File.Exists(prev.FilePath))
-                    {
-                        var dc2 = App.Connector.DisconnectCount;
-                        _config.ActiveOvpnId = prev.Id;
-                        _config.Save();
-                        await App.Connector.ConnectAsync(prev);
-                        if (App.Connector.DisconnectCount != dc2)
-                        {
-                            await App.Connector.DisconnectAsync();
-                            _connecting = false;
-                            _vpnDownSince = null;
-                        }
-                        else
-                        {
-                            _connecting = true;
-                            _vpnDownSince = DateTime.UtcNow;
-                        }
-                    }
-                }
-                catch (Exception ex2)
-                {
-                    FooterText.Text = $"Rotate failed: {ex.Message} / restore failed: {ex2.Message}";
-                }
-            }
+            await SwitchProfileAsync(next, liveId);
         }
         finally
         {
             _rotating = false;
+        }
+    }
+
+    private async void RotateNowBtn_Click(object sender, RoutedEventArgs e)
+    {
+        if (!App.Connector.WantConnected) return;
+        if (_rotating) return;
+        _rotating = true;
+        try
+        {
+            _config.RefreshFromDisk();
+            var liveId = App.Connector.ActiveProfileId ?? _config.ActiveOvpnId;
+            var others = _config.OvpnFiles
+                .Where(p => p.Id != liveId && IsConnectable(p))
+                .ToList();
+            if (others.Count == 0)
+            {
+                FooterText.Text = "No other connectable profile to rotate to";
+                return;
+            }
+            var next = others[Random.Shared.Next(others.Count)];
+            await SwitchProfileAsync(next, liveId);
+        }
+        finally
+        {
+            _rotating = false;
+        }
+    }
+
+    /// <summary>
+    /// Switch the live tunnel to another profile: disconnect, connect, and
+    /// fall back to the previous profile on failure so a bad rotate never
+    /// leaves the tunnel dead. Honors an interleaved manual Disconnect.
+    /// </summary>
+    private async System.Threading.Tasks.Task SwitchProfileAsync(OvpnEntry next, string? prevId)
+    {
+        // NOTE: callers own the _rotating guard; this method only switches.
+        try
+        {
+            FooterText.Text = $"Rotating to \"{next.DisplayName}\"…";
+            var dc = App.Connector.DisconnectCount;
+            await App.Connector.DisconnectAsync();
+            // A manual Disconnect interleaved with our own (user hit
+            // Disconnect/Cancel while we awaited) must NOT be
+            // resurrected by the Connect below.
+            if (App.Connector.DisconnectCount != dc + 1) return;
+            _config.ActiveOvpnId = next.Id;
+            _config.Save();
+            await App.Connector.ConnectAsync(next);
+            if (!App.Connector.WantConnected)
+            {
+                // Stopped while connecting — leave it stopped.
+                _connecting = false;
+                _vpnDownSince = null;
+                return;
+            }
+            _connecting = true;
+            _vpnDownSince = DateTime.UtcNow;
+            UpdateProfileText();
+        }
+        catch (Exception ex)
+        {
+            // A concurrent manual Disconnect (WantConnected==false) wins:
+            // do not restore anything, leave the tunnel stopped.
+            if (!App.Connector.WantConnected)
+            {
+                _connecting = false;
+                _vpnDownSince = null;
+                return;
+            }
+            // Never leave the tunnel dead after a failed rotate: fall
+            // back to the previous profile (WantConnected stays true
+            // either way so the watchdog keeps repairing).
+            FooterText.Text = $"Rotate to \"{next.DisplayName}\" failed: {ex.Message} — restoring previous";
+            // Same interleave guard as above: a manual Disconnect during
+            // the restore connect must win — honor it instead of leaving
+            // a resurrected tunnel behind.
+            try
+            {
+                var prev = _config.OvpnFiles.FirstOrDefault(p => p.Id == prevId);
+                if (prev is not null && System.IO.File.Exists(prev.FilePath))
+                {
+                    var dc2 = App.Connector.DisconnectCount;
+                    _config.ActiveOvpnId = prev.Id;
+                    _config.Save();
+                    await App.Connector.ConnectAsync(prev);
+                    if (App.Connector.DisconnectCount != dc2)
+                    {
+                        await App.Connector.DisconnectAsync();
+                        _connecting = false;
+                        _vpnDownSince = null;
+                    }
+                    else
+                    {
+                        _connecting = true;
+                        _vpnDownSince = DateTime.UtcNow;
+                        UpdateProfileText();
+                    }
+                }
+            }
+            catch (Exception ex2)
+            {
+                FooterText.Text = $"Rotate failed: {ex.Message} / restore failed: {ex2.Message}";
+            }
         }
     }
 

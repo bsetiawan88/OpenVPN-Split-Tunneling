@@ -64,11 +64,13 @@
                                       Margin="24,2,0,0" />
                     </StackPanel>
                     <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                        <ui:Button x:Name="LogBtn"
-                                   Content="Log"
+                        <ui:Button x:Name="RotateNowBtn"
+                                   Content="Rotate"
+                                   Icon="{ui:SymbolIcon ArrowClockwise20}"
                                    Appearance="Secondary"
-                                   ToolTip="View OpenVPN log (diagnose connection failures)"
-                                   Click="LogBtn_Click"
+                                   IsEnabled="False"
+                                   ToolTip="Connect first, then rotate"
+                                   Click="RotateNowBtn_Click"
                                    Margin="0,0,8,0" />
                         <ui:Button x:Name="VpnSettingsBtn"
                                    Icon="{ui:SymbolIcon Settings20}"
@@ -82,7 +84,7 @@
                                    Appearance="Primary"
                                    IsEnabled="False"
                                    Click="ConnectBtn_Click"
-                                   ToolTip="Connect using the last-used profile (or the first one if you haven't connected yet)" />
+                                   ToolTip="Connect using a random profile" />
                     </StackPanel>
                 </Grid>
             </Border>
@@ -264,7 +266,7 @@
                 </Grid>
             </Border>
 
-            <!-- Activity log (visible only when "Enable logging" is checked) -->
+            <!-- Activity + OpenVPN log tabs (visible only when "Enable logging" is checked) -->
             <Border Grid.Row="4"
                     x:Name="LogPanel"
                     Margin="0,16,0,0"
@@ -272,33 +274,94 @@
                     CornerRadius="8"
                     Padding="20,12"
                     Visibility="Collapsed">
-                <Grid>
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
-                    <Grid Grid.Row="0">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <ui:TextBlock Grid.Column="0" Text="Activity Log" FontTypography="Subtitle" />
-                        <ui:Button Grid.Column="1"
-                                   x:Name="ClearLogBtn"
-                                   Content="Clear"
-                                   Click="ClearLogBtn_Click" />
-                    </Grid>
-                    <ScrollViewer Grid.Row="1" Margin="0,8,0,0" Height="150"
-                                  VerticalScrollBarVisibility="Auto"
-                                  HorizontalScrollBarVisibility="Auto"
-                                  x:Name="LogScroller">
-                        <ui:TextBlock x:Name="LogText"
-                                      Text=""
-                                      FontFamily="Consolas"
-                                      FontTypography="Caption"
-                                      TextWrapping="NoWrap" />
-                    </ScrollViewer>
-                </Grid>
+                <TabControl x:Name="LogTabs"
+                            Background="Transparent"
+                            BorderThickness="0"
+                            SelectionChanged="LogTabs_SelectionChanged">
+                    <TabItem Header="Activity" x:Name="ActivityTab">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <Grid Grid.Row="0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <ui:TextBlock Grid.Column="0"
+                                              Text="Redirector events — per-app admissions, bridges, VPN transitions"
+                                              FontTypography="Caption"
+                                              Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                              VerticalAlignment="Center" />
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <ui:Button x:Name="ClearLogBtn"
+                                               Content="Clear"
+                                               Click="ClearLogBtn_Click"
+                                               Margin="0,0,8,0" />
+                                    <ui:Button x:Name="CopyActivityBtn"
+                                               Content="Copy"
+                                               Click="CopyActivityBtn_Click" />
+                                </StackPanel>
+                            </Grid>
+                            <ScrollViewer Grid.Row="1" Margin="0,8,0,0" Height="130"
+                                          VerticalScrollBarVisibility="Auto"
+                                          HorizontalScrollBarVisibility="Auto"
+                                          x:Name="LogScroller">
+                                <TextBox x:Name="LogText"
+                                         Text=""
+                                         FontFamily="Consolas"
+                                         IsReadOnly="True"
+                                         IsReadOnlyCaretVisible="True"
+                                         AcceptsReturn="True"
+                                         TextWrapping="NoWrap"
+                                         Background="Transparent"
+                                         BorderThickness="0" />
+                            </ScrollViewer>
+                        </Grid>
+                    </TabItem>
+                    <TabItem Header="OpenVPN Log" x:Name="OpenVpnTab">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+                            <Grid Grid.Row="0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <ui:TextBlock Grid.Column="0"
+                                              Text="openvpn.log — auto-refreshes while visible"
+                                              FontTypography="Caption"
+                                              Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                              VerticalAlignment="Center" />
+                                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                    <ui:Button x:Name="RefreshOvpnLogBtn"
+                                               Content="Refresh"
+                                               Click="RefreshOvpnLogBtn_Click"
+                                               Margin="0,0,8,0" />
+                                    <ui:Button x:Name="CopyOvpnLogBtn"
+                                               Content="Copy"
+                                               Click="CopyOvpnLogBtn_Click" />
+                                </StackPanel>
+                            </Grid>
+                            <ScrollViewer Grid.Row="1" Margin="0,8,0,0" Height="130"
+                                          VerticalScrollBarVisibility="Auto"
+                                          HorizontalScrollBarVisibility="Auto">
+                                <TextBox x:Name="OpenVpnLogText"
+                                         Text=""
+                                         FontFamily="Consolas"
+                                         IsReadOnly="True"
+                                         IsReadOnlyCaretVisible="True"
+                                         AcceptsReturn="True"
+                                         TextWrapping="NoWrap"
+                                         Background="Transparent"
+                                         BorderThickness="0" />
+                            </ScrollViewer>
+                        </Grid>
+                    </TabItem>
+                </TabControl>
             </Border>
         </Grid>
 

@@ -30,7 +30,8 @@ public class VpnConnector
     public int ManagementPort { get; private set; }
 
     /// <summary>True between Connect and manual Disconnect. Drives auto-reconnect.</summary>
-    public bool WantConnected { get; private set; }
+    public bool WantConnected => _wantConnected;
+    private volatile bool _wantConnected;
 
     /// <summary>Master switch for auto-reconnect. Always true in production; tests can flip it.</summary>
     public bool ReconnectEnabled { get; set; } = true;
@@ -51,6 +52,9 @@ public class VpnConnector
     private readonly object _lock = new();
     private bool _reconnecting;
     private int _epoch;
+    /// <summary>Serializes openvpn starts: a manual Connect racing a
+    /// post-backoff Restart must not interleave kill/settle/Start.</summary>
+    private readonly SemaphoreSlim _startGate = new(1, 1);
 
     private static readonly string[] OpenVpnPaths =
     {
@@ -83,7 +87,7 @@ public class VpnConnector
         // profile window's Connect button) must retire the old openvpn
         // first, otherwise the orphan keeps its routes/ports untracked.
         await DisconnectAsync().ConfigureAwait(false);
-        WantConnected = true;
+        _wantConnected = true;
         ReconnectAttempt = 0;
         LastError = "";
         await StartOpenVpnAsync(profile).ConfigureAwait(false);
@@ -175,7 +179,10 @@ public class VpnConnector
         // args) would otherwise leave a STALE log behind and the
         // AUTH_FAILED tail check could false-positive on the next exit.
         try { File.Delete(logFile); } catch { }
-        ManagementPort = GetFreePort();
+        // Port picked here, consumed below inside the start gate via a local
+        // copy (never the field mid-flight between concurrent starters).
+        var mgmtPort = GetFreePort();
+        lock (_lock) { ManagementPort = mgmtPort; }
 
         // WorkingDirectory MUST be the .ovpn's folder: profiles reference
         // ca/cert/key/tls-auth by relative path. The old code launched with
@@ -202,7 +209,9 @@ public class VpnConnector
         var needsUi = OvpnParser.NeedsUiCredentials(profile.FilePath);
         if (needsUi && hasCreds)
         {
-            var authFile = Path.Combine(runtimeDir, "auth.txt");
+            // Per-profile filename: concurrent starts for different profiles
+            // must not cross-contaminate one shared auth.txt.
+            var authFile = Path.Combine(runtimeDir, $"auth-{profile.Id}.txt");
             await File.WriteAllTextAsync(
                 authFile,
                 $"{profile.Username}\n{profile.GetPassword()}\n").ConfigureAwait(false);
@@ -217,10 +226,9 @@ public class VpnConnector
                 "Open the gear icon to add credentials and try again.");
         }
 
-        // --windows-driver wintun bypasses the TAP-Windows6 DHCP path that
-        // sometimes leaves the adapter stuck on 169.254.x.x even after
-        // "Initialization Sequence Completed". Wintun does its own IP
-        // configuration via SetIpInterfaceEntry.
+        // NOTE: no --windows-driver flag on purpose. OpenVPN 2.7 picks DCO
+        // by default (proven by working setups); forcing wintun had no
+        // effect (DCO was opened anyway) and only added a fallback variable.
         //
         // --pull-filter ignore redirect-gateway tells openvpn to drop the
         // server-pushed "default route via VPN" directive. Without it the
@@ -228,18 +236,20 @@ public class VpnConnector
         // to route through it. The redirector pins tunneled processes to
         // the VPN adapter via IP_UNICAST_IF, so they egress through the
         // tunnel without us hijacking the default route.
-        args.Append($"--management 127.0.0.1 {ManagementPort} ");
-        args.Append("--windows-driver wintun ");
+        //
+        // NOTE: pushed DNS (dhcp-option) is deliberately ACCEPTED, matching
+        // the known-working plain script launch. Stripping it was tried and
+        // reverted: it diverged host DNS behavior from the working setup.
+        // block-outside-dns is still filtered: it would install WFP rules
+        // forcing ALL host DNS through the tunnel, breaking untunneled apps
+        // whenever the tunnel DNS is unreachable from the LAN.
+        //
+        // --auth-nocache avoids caching passwords in memory (also silences
+        // the openvpn warning); reconnects re-read our auth file anyway.
+        args.Append($"--management 127.0.0.1 {mgmtPort} ");
+        args.Append("--auth-nocache ");
         args.Append("--pull-filter ignore \"redirect-gateway\" ");
         args.Append("--pull-filter ignore \"block-outside-dns\" ");
-        // Ignore server-pushed DNS: the pushed servers are usually reachable
-        // only through the tunnel, but Windows would use them for EVERY app
-        // on the box — including untunneled ones whose queries still egress
-        // via the LAN and therefore time out. That single misconfiguration
-        // presents as "no internet for any app the moment the VPN connects".
-        // Split-tunnel keeps host DNS; tunneled traffic still egresses via
-        // the VPN interface, only name resolution stays local.
-        args.Append("--pull-filter ignore \"dhcp-option\" ");
         args.Append($"--log \"{logFile}\" ");
         args.Append("--verb 3");
 
@@ -253,37 +263,73 @@ public class VpnConnector
             WorkingDirectory = workDir,
         };
 
-        lock (_lock)
-        {
-            // A manual Disconnect during the awaits above (auth file write)
-            // must not be followed by a fresh Process.Start — that would
-            // resurrect the tunnel with WantConnected=false.
-            if (!WantConnected) throw new OperationCanceledException("Connect cancelled (disconnected before start).");
-        }
-
-        var proc = Process.Start(psi)
-            ?? throw new InvalidOperationException("Failed to start openvpn.exe");
+        // Serialized: a manual Connect racing a post-backoff Restart must not
+        // interleave stray-kill/settle/Start (one side's kill would reap the
+        // other's fresh process). Held from stray-kill through assignment.
+        await _startGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            // Lift openvpn into the UI's Job Object so it dies when we do.
-            JobManager.Assign(proc);
-        }
-        catch { }
+            // Kill stray openvpn.exe instances left by script runs, crashes, or
+            // half-torn-down reconnects. Two managers fighting over the DCO
+            // device and routes is exactly how you get a tunnel that completes
+            // its handshake and then dies with "network location cannot be
+            // reached". Our own tracked instance is already dead at this point
+            // (Connect/Restart killed it), so anything still alive is stray.
+            // Mirror the working script: wait briefly for tunnel cleanup when
+            // we actually killed something.
+            if (KillStrayOpenVpnProcesses())
+            {
+                Status("Waiting for previous tunnel cleanup…");
+                await Task.Delay(2000).ConfigureAwait(false);
+            }
 
-        int epoch;
-        lock (_lock)
+            lock (_lock)
+            {
+                // A manual Disconnect during the awaits above (auth file write)
+                // must not be followed by a fresh Process.Start — that would
+                // resurrect the tunnel with WantConnected=false.
+                if (!WantConnected) throw new OperationCanceledException("Connect cancelled (disconnected before start).");
+            }
+
+            var proc = Process.Start(psi)
+                ?? throw new InvalidOperationException("Failed to start openvpn.exe");
+            try
+            {
+                // Lift openvpn into the UI's Job Object so it dies when we do.
+                JobManager.Assign(proc);
+            }
+            catch { }
+
+            int epoch;
+            lock (_lock)
+            {
+                _process = proc;
+                _epoch++;
+                epoch = _epoch;
+            }
+            try { proc.EnableRaisingEvents = true; } catch { }
+            proc.Exited += (_, _) => _ = OnProcessExitedAsync(epoch);
+
+            ActiveProfileId = profile.Id;
+            CurrentProfile = profile;
+            StateChanged?.Invoke(this, EventArgs.Empty);
+            Status($"Connecting via \"{profile.DisplayName}\"…");
+
+            // Close the micro-window between the pre-Start Want check and
+            // Process.Start: a Disconnect landing exactly there must not
+            // leave a resurrected tunnel behind.
+            bool cancelled;
+            lock (_lock) { cancelled = !_wantConnected; }
+            if (cancelled)
+            {
+                await KillProcessAsync().ConfigureAwait(false);
+                throw new OperationCanceledException("Connect cancelled (disconnected right after start).");
+            }
+        }
+        finally
         {
-            _process = proc;
-            _epoch++;
-            epoch = _epoch;
+            _startGate.Release();
         }
-        try { proc.EnableRaisingEvents = true; } catch { }
-        proc.Exited += (_, _) => _ = OnProcessExitedAsync(epoch);
-
-        ActiveProfileId = profile.Id;
-        CurrentProfile = profile;
-        StateChanged?.Invoke(this, EventArgs.Empty);
-        Status($"Connecting via \"{profile.DisplayName}\"…");
 
         await Task.CompletedTask.ConfigureAwait(false);
     }
@@ -538,18 +584,21 @@ public class VpnConnector
     public async Task DisconnectAsync()
     {
         CancelPendingReconnect();
-        WantConnected = false;
+        _wantConnected = false;
         ReconnectAttempt = 0;
         lock (_lock) { _disconnectCount++; _reconnecting = false; }
 
         // Graceful via management socket first; fall through to Kill if that
-        // doesn't take openvpn down within ~1.5s.
-        if (ManagementPort != 0)
+        // doesn't take openvpn down within ~1.5s. Port snapshotted under
+        // lock: a concurrent starter may already have assigned the next one.
+        int mgmtPort;
+        lock (_lock) { mgmtPort = ManagementPort; }
+        if (mgmtPort != 0)
         {
             try
             {
                 using var tcp = new TcpClient();
-                await tcp.ConnectAsync("127.0.0.1", ManagementPort).ConfigureAwait(false);
+                await tcp.ConnectAsync("127.0.0.1", mgmtPort).ConfigureAwait(false);
                 using var stream = tcp.GetStream();
                 var sig = Encoding.ASCII.GetBytes("signal SIGTERM\n");
                 await stream.WriteAsync(sig).ConfigureAwait(false);
@@ -561,7 +610,7 @@ public class VpnConnector
 
         await KillProcessAsync().ConfigureAwait(false);
 
-        ManagementPort = 0;
+        lock (_lock) { ManagementPort = 0; }
         ActiveProfileId = null;
         CurrentProfile = null;
         LastError = "";
@@ -595,6 +644,36 @@ public class VpnConnector
             catch { }
         }
         try { proc?.Dispose(); } catch { }
+    }
+
+    /// <summary>
+    /// Kill every openvpn.exe on the box by process name; returns true when
+    /// something was killed. Relies on the caller having already cleared our
+    /// own tracked instance, so anything still alive is stray by definition
+    /// (nothing here filters "ours" vs "theirs"). Never throws.
+    /// </summary>
+    private static bool KillStrayOpenVpnProcesses()
+    {
+        var killed = false;
+        Process[] strays;
+        try { strays = Process.GetProcessesByName("openvpn"); }
+        catch { return false; }
+        foreach (var p in strays)
+        {
+            try
+            {
+                bool exited;
+                try { exited = p.HasExited; } catch { exited = true; }
+                if (!exited)
+                {
+                    p.Kill(entireProcessTree: true);
+                    killed = true;
+                }
+            }
+            catch { }
+            finally { try { p.Dispose(); } catch { } }
+        }
+        return killed;
     }
 
     private void CancelPendingReconnect()
