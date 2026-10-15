@@ -168,10 +168,14 @@ fn on_vpn_change(
     }
 }
 
+/// Keyed on the FULL 4-tuple: without dst, an ephemeral port reused for a
+/// different destination collides with the old flow and gets RST'd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TcpKey {
     src_ip: Ipv4Addr,
     src_port: u16,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -188,12 +192,19 @@ struct TcpFlow {
     exe: String,
     original_dst: SocketAddr,
     state: TcpState,
+    /// Last data movement or state transition. Feeds the GC sweep: a flow
+    /// stuck in a half-closed state squats its key forever, so every future
+    /// connection reusing the ephemeral port gets RST'd ("other side closed").
+    last_active: Instant,
 }
 
 enum TcpState {
     Pending,
     Bridging {
-        app_to_remote: mpsc::Sender<Vec<u8>>,
+        /// Option so the app-side half-close propagates: taking it drops the
+        /// Sender, the bridge write-task observes recv()==None and FINs the
+        /// remote leg instead of wedging the flow in CloseWait forever.
+        app_to_remote: Option<mpsc::Sender<Vec<u8>>>,
         remote_to_app: mpsc::Receiver<Vec<u8>>,
         app_half_closed: bool,
     },
@@ -388,7 +399,7 @@ fn handle_capture(
     }
 
     if is_tcp {
-        let key = TcpKey { src_ip, src_port };
+        let key = TcpKey { src_ip, src_port, dst_ip, dst_port };
         if !tcp_flows.contains_key(&key) {
             let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
             let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
@@ -411,6 +422,7 @@ fn handle_capture(
                     exe,
                     original_dst: SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port)),
                     state: TcpState::Pending,
+                    last_active: Instant::now(),
                 },
             );
         }
@@ -521,53 +533,113 @@ fn service_tcp_flows(
     bus: &Arc<StatusBus>,
 ) {
     let mut to_remove = Vec::new();
+    let now = Instant::now();
     for (key, flow) in tcp_flows.iter_mut() {
         match &mut flow.state {
             TcpState::Pending => {
-                let socket = sockets.get_mut::<tcp::Socket>(flow.handle);
-                if socket.state() == tcp::State::Established {
-                    let (a2r_tx, a2r_rx) = mpsc::channel::<Vec<u8>>(BRIDGE_CHANNEL_DEPTH);
-                    let (r2a_tx, r2a_rx) = mpsc::channel::<Vec<u8>>(BRIDGE_CHANNEL_DEPTH);
-
-                    tracing::info!(
-                        "tcp bridge open: pid={} {}:{} -> {}",
-                        flow.pid, key.src_ip, key.src_port, flow.original_dst
+                // Half-open that never completes (blackholed SYN, app gave
+                // up): free the key instead of burning the ephemeral port
+                // forever — the next SYN for it must build a fresh listener.
+                if now.duration_since(flow.last_active) > Duration::from_secs(30) {
+                    tracing::debug!(
+                        "tcp pending timeout: pid={} -> {}",
+                        flow.pid, flow.original_dst
                     );
-                    bus.emit(
-                        EventKind::BridgeOpened,
-                        format!(
-                            "TCP \"{}\" (pid {}) {}:{} -> {} via VPN",
-                            flow.exe, flow.pid, key.src_ip, key.src_port, flow.original_dst
-                        ),
-                    );
+                    flow.state = TcpState::Closed;
+                } else {
+                    let socket = sockets.get_mut::<tcp::Socket>(flow.handle);
+                    if matches!(socket.state(), tcp::State::Closed) {
+                        // RST before the handshake completed: retire now
+                        // instead of squatting the key for the 30s timeout.
+                        flow.state = TcpState::Closed;
+                    } else if socket.state() == tcp::State::Established {
+                        let (a2r_tx, a2r_rx) = mpsc::channel::<Vec<u8>>(BRIDGE_CHANNEL_DEPTH);
+                        let (r2a_tx, r2a_rx) = mpsc::channel::<Vec<u8>>(BRIDGE_CHANNEL_DEPTH);
 
-                    let dst = flow.original_dst;
-                    let bus_fail = bus.clone();
-                    let fail_exe = flow.exe.clone();
-                    let fail_pid = flow.pid;
-                    tokio_handle.spawn(async move {
-                        if let Err(e) = tcp_bridge(dst, vpn_target, a2r_rx, r2a_tx).await {
-                            let detail =
-                                format!("TCP \"{}\" (pid {}) to {} failed: {}", fail_exe, fail_pid, dst, short(&e.to_string()));
-                            tracing::warn!("{}", detail);
-                            bus_fail.emit(EventKind::BridgeFailed, detail);
-                        }
-                    });
-                    stats.bridges_opened.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(
+                            "tcp bridge open: pid={} {}:{} -> {}",
+                            flow.pid, key.src_ip, key.src_port, flow.original_dst
+                        );
+                        bus.emit(
+                            EventKind::BridgeOpened,
+                            format!(
+                                "TCP \"{}\" (pid {}) {}:{} -> {} via VPN",
+                                flow.exe, flow.pid, key.src_ip, key.src_port, flow.original_dst
+                            ),
+                        );
 
-                    flow.state = TcpState::Bridging {
-                        app_to_remote: a2r_tx,
-                        remote_to_app: r2a_rx,
-                        app_half_closed: false,
-                    };
+                        let dst = flow.original_dst;
+                        let bus_fail = bus.clone();
+                        let fail_exe = flow.exe.clone();
+                        let fail_pid = flow.pid;
+                        tokio_handle.spawn(async move {
+                            if let Err(e) = tcp_bridge(dst, vpn_target, a2r_rx, r2a_tx).await {
+                                let detail =
+                                    format!("TCP \"{}\" (pid {}) to {} failed: {}", fail_exe, fail_pid, dst, short(&e.to_string()));
+                                tracing::warn!("{}", detail);
+                                bus_fail.emit(EventKind::BridgeFailed, detail);
+                            }
+                        });
+                        stats.bridges_opened.fetch_add(1, Ordering::Relaxed);
+
+                        flow.last_active = now;
+                        flow.state = TcpState::Bridging {
+                            app_to_remote: Some(a2r_tx),
+                            remote_to_app: r2a_rx,
+                            app_half_closed: false,
+                        };
+                    }
                 }
             }
             TcpState::Bridging { app_to_remote, remote_to_app, app_half_closed } => {
                 let socket = sockets.get_mut::<tcp::Socket>(flow.handle);
-                pump_tcp_app_to_remote(socket, app_to_remote, app_half_closed, flow.pid, stats);
-                pump_tcp_remote_to_app(socket, remote_to_app, flow.pid, stats);
-                if matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait) {
+                // Remote leg gone AND its tail bytes drained (closed but
+                // non-empty still has data for the app): FIN our side so the
+                // app sees a clean close instead of hanging, then retire.
+                if remote_to_app.is_closed() && remote_to_app.is_empty() {
+                    socket.close();
                     flow.state = TcpState::Closed;
+                } else {
+                    let mut moved_bytes = 0u64;
+                    if let Some(tx) = app_to_remote {
+                        moved_bytes += pump_tcp_app_to_remote(socket, tx, flow.pid, stats);
+                    }
+                    moved_bytes += pump_tcp_remote_to_app(socket, remote_to_app, flow.pid, stats);
+                    if moved_bytes > 0 {
+                        flow.last_active = now;
+                    }
+                    if !*app_half_closed
+                        && matches!(
+                            socket.state(),
+                            tcp::State::CloseWait | tcp::State::LastAck | tcp::State::Closing
+                        )
+                    {
+                        *app_half_closed = true;
+                        flow.last_active = now;
+                    }
+                    if *app_half_closed && app_to_remote.is_some() {
+                        // Propagate the app FIN to the remote leg: dropping
+                        // the sender ends the bridge write-task (which
+                        // shutdown()s the remote socket) instead of wedging
+                        // this flow in CloseWait forever.
+                        *app_to_remote = None;
+                    }
+                    if matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait) {
+                        flow.state = TcpState::Closed;
+                    } else if *app_half_closed
+                        && now.duration_since(flow.last_active) > Duration::from_secs(120)
+                    {
+                        // Wedged half-close (peer never FINs back): stop
+                        // squatting the key. Fully-open idle flows are
+                        // deliberately spared — those can be legit persistent
+                        // streams (API SSE/WebSocket) quiet between messages.
+                        tracing::info!(
+                            "tcp half-close idle timeout: pid={} {}:{} -> {}",
+                            flow.pid, key.src_ip, key.src_port, flow.original_dst
+                        );
+                        socket.close();
+                        flow.state = TcpState::Closed;
+                    }
                 }
             }
             TcpState::Closed => to_remove.push(*key),
@@ -624,13 +696,16 @@ fn service_udp_flows(
     }
 }
 
+/// Moves app bytes into the bridge channel. Returns bytes moved (feeds the
+/// flow GC clock). Half-close detection lives in the caller, which owns the
+/// Option<Sender> and propagates the FIN by dropping it.
 fn pump_tcp_app_to_remote(
     socket: &mut tcp::Socket,
     sender: &mpsc::Sender<Vec<u8>>,
-    app_half_closed: &mut bool,
     pid: u32,
     stats: &Stats,
-) {
+) -> u64 {
+    let mut moved = 0u64;
     while socket.can_recv() {
         let mut buf = vec![0u8; SMOLTCP_CHUNK];
         let n = match socket.recv_slice(&mut buf) {
@@ -643,18 +718,14 @@ fn pump_tcp_app_to_remote(
         buf.truncate(n);
         match sender.try_send(buf) {
             Ok(()) => {
+                moved += n as u64;
                 stats.add_app_to_remote(n as u64);
                 stats.add_pid_out(pid, n as u64);
             }
             Err(_) => break,
         }
     }
-    if !*app_half_closed && matches!(
-        socket.state(),
-        tcp::State::CloseWait | tcp::State::LastAck | tcp::State::Closing
-    ) {
-        *app_half_closed = true;
-    }
+    moved
 }
 
 fn pump_tcp_remote_to_app(
@@ -662,7 +733,8 @@ fn pump_tcp_remote_to_app(
     receiver: &mut mpsc::Receiver<Vec<u8>>,
     pid: u32,
     stats: &Stats,
-) {
+) -> u64 {
+    let mut moved = 0u64;
     while socket.can_send() {
         match receiver.try_recv() {
             Ok(data) => {
@@ -675,9 +747,10 @@ fn pump_tcp_remote_to_app(
                             stats.add_remote_to_app(n as u64);
                             stats.add_pid_in(pid, n as u64);
                         }
-                        Err(_) => return,
+                        Err(_) => return moved,
                     }
                 }
+                moved += written as u64;
             }
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -686,6 +759,7 @@ fn pump_tcp_remote_to_app(
             }
         }
     }
+    moved
 }
 
 /// Pin a TCP/UDP socket to a specific outgoing interface so the kernel ignores
