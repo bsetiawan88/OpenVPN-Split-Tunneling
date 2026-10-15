@@ -29,12 +29,14 @@ public partial class MainWindow : FluentWindow
     {
         InitializeComponent();
         _statusClient.SnapshotReceived += OnSnapshot;
+        _statusClient.LogReceived += OnLogEvent;
         _statusClient.ConnectionChanged += OnConnectionChanged;
         App.Connector.StatusMessage += OnConnectorStatus;
         App.Connector.StateChanged += OnConnectorStateChanged;
         Loaded += (_, _) => {
             _config.RefreshFromDisk();
             InitRotateControls();
+            InitLogPanel();
             _statusClient.Start();
             RefreshAppList();
             UpdateConnectButtonState(false);
@@ -101,6 +103,7 @@ public partial class MainWindow : FluentWindow
                 StateText.Text = "Unknown VPN state";
                 StateDot.Fill = new SolidColorBrush(Color.FromRgb(0x6B, 0x6B, 0x6B));
                 AdapterText.Text = string.Empty;
+                ProfileText.Text = string.Empty;
             }
             else if (vpn.Up)
             {
@@ -124,6 +127,7 @@ public partial class MainWindow : FluentWindow
                     StateDot.Fill = new SolidColorBrush(Color.FromRgb(0xC5, 0x84, 0x1A));
                     AdapterText.Text = $"egress source {vpn.AdapterIp} — repairing split-tunnel route…";
                 }
+                UpdateProfileText();
                 UptimeText.Text = FormatUptime(vpn.UptimeMs);
                 UpdateConnectButtonState(true);
             }
@@ -135,6 +139,7 @@ public partial class MainWindow : FluentWindow
                 AdapterText.Text = string.IsNullOrEmpty(_connectorStatus)
                     ? "openvpn handshake in progress"
                     : _connectorStatus;
+                UpdateProfileText();
                 UptimeText.Text = "—";
             }
             else
@@ -160,6 +165,7 @@ public partial class MainWindow : FluentWindow
                     StateText.Text = "VPN disconnected";
                     StateDot.Fill = new SolidColorBrush(Color.FromRgb(0xC5, 0x42, 0x42));
                     AdapterText.Text = string.Empty;
+                    ProfileText.Text = string.Empty;
                     _vpnDownSince = null;
                 }
                 UptimeText.Text = "—";
@@ -228,10 +234,26 @@ public partial class MainWindow : FluentWindow
         settings.ShowDialog();
     }
 
+    private void LogBtn_Click(object sender, RoutedEventArgs e)
+    {
+        var log = new LogWindow { Owner = this };
+        log.Show();
+    }
+
+    /// <summary>
+    /// Connected profile name under the egress IP. Prefers the live
+    /// connector profile, falls back to the configured active one.
+    /// </summary>
+    private void UpdateProfileText()
+    {
+        var name = App.Connector.CurrentProfile?.DisplayName
+            ?? ResolveActiveProfile()?.DisplayName;
+        ProfileText.Text = string.IsNullOrEmpty(name) ? string.Empty : $"profile \"{name}\"";
+    }
+
     private void VpnSettingsBtn_Click(object sender, RoutedEventArgs e)
     {
-        var vpn = new VpnConfigWindow(_config) { Owner = this };
-        vpn.ConfigChanged += (_, _) =>
+        var vpn = new VpnConfigWindow(_config) { Owner = this };        vpn.ConfigChanged += (_, _) =>
         {
             _config = Config.Load();
             UpdateConnectButtonState(_lastVpnUp);
@@ -337,7 +359,7 @@ public partial class MainWindow : FluentWindow
             return;
         }
 
-        if (OvpnParser.RequiresAuth(profile.FilePath)
+        if (OvpnParser.NeedsUiCredentials(profile.FilePath)
             && (string.IsNullOrWhiteSpace(profile.Username)
                 || string.IsNullOrWhiteSpace(profile.GetPassword())))
         {
@@ -413,6 +435,54 @@ public partial class MainWindow : FluentWindow
             UpdateConnectButtonState(false);
         }
     }
+
+    #region Activity log
+
+    private readonly System.Collections.Generic.List<string> _logLines = new();
+    private const int MaxLogLines = 1000;
+
+    private void InitLogPanel()
+    {
+        LogCheck.IsChecked = _config.LoggingEnabled;
+        LogPanel.Visibility = _config.LoggingEnabled ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void LogCheck_Changed(object sender, RoutedEventArgs e)
+    {
+        _config.LoggingEnabled = LogCheck.IsChecked == true;
+        _config.Save();
+        LogPanel.Visibility = _config.LoggingEnabled ? Visibility.Visible : Visibility.Collapsed;
+        if (_config.LoggingEnabled && _logLines.Count == 0)
+            AppendLogLine("logging enabled — waiting for redirector events…");
+    }
+
+    private void ClearLogBtn_Click(object sender, RoutedEventArgs e)
+    {
+        _logLines.Clear();
+        LogText.Text = string.Empty;
+    }
+
+    private void OnLogEvent(object? sender, Vpnclient.Status.Event e)
+    {
+        // Buffer only while opted in: without the gate the list pointlessly
+        // grows to its cap even for users who never open the panel.
+        if (!_config.LoggingEnabled) return;
+        Dispatcher.BeginInvoke(() => AppendLogLine($"[{e.Kind}] {e.Detail}"));
+    }
+
+    private void AppendLogLine(string line)
+    {
+        _logLines.Add($"[{DateTime.Now:HH:mm:ss}] {line}");
+        while (_logLines.Count > MaxLogLines)
+            _logLines.RemoveAt(0);
+        // Rebuilding the whole text on every event is O(n) but n is capped
+        // and events arrive at flow-rate (per connection), not packet-rate.
+        LogText.Text = string.Join(Environment.NewLine, _logLines);
+        if (LogPanel.Visibility == Visibility.Visible)
+            LogScroller.ScrollToBottom();
+    }
+
+    #endregion
 
     #region Rotate every
 
@@ -507,7 +577,7 @@ public partial class MainWindow : FluentWindow
             {
                 var cand = _config.OvpnFiles[(start + i + _config.OvpnFiles.Count) % _config.OvpnFiles.Count];
                 if (!System.IO.File.Exists(cand.FilePath)) continue;
-                if (OvpnParser.RequiresAuth(cand.FilePath)
+                if (OvpnParser.NeedsUiCredentials(cand.FilePath)
                     && (string.IsNullOrWhiteSpace(cand.Username) || string.IsNullOrWhiteSpace(cand.GetPassword())))
                     continue;
                 next = cand;

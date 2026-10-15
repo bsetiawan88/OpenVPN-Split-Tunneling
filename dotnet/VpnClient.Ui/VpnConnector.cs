@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -192,15 +193,14 @@ public class VpnConnector
         var args = new StringBuilder();
         args.Append($"--config \"{configPath}\" ");
 
-        // Only pass --auth-user-pass when the profile actually needs it.
-        // Unconditional auth with an empty file broke cert-only profiles and
-        // turned missing-credential cases into silent AUTH_FAILED loops.
-        // Both username AND password are required: a half-filled auth file
-        // (one empty line) fails server-side just as opaquely.
-        var needsAuth = OvpnParser.RequiresAuth(profile.FilePath);
+        // Only pass --auth-user-pass when the credentials MUST come from our
+        // UI. Profiles that already carry auth (existing auth file or filled
+        // inline block) are left alone: forcing our flag would override the
+        // working credential the .ovpn already points at.
         var hasCreds = !string.IsNullOrWhiteSpace(profile.Username)
             && !string.IsNullOrWhiteSpace(profile.GetPassword());
-        if (needsAuth && hasCreds)
+        var needsUi = OvpnParser.NeedsUiCredentials(profile.FilePath);
+        if (needsUi && hasCreds)
         {
             var authFile = Path.Combine(runtimeDir, "auth.txt");
             await File.WriteAllTextAsync(
@@ -208,7 +208,7 @@ public class VpnConnector
                 $"{profile.Username}\n{profile.GetPassword()}\n").ConfigureAwait(false);
             args.Append($"--auth-user-pass \"{authFile}\" ");
         }
-        else if (needsAuth && !hasCreds)
+        else if (needsUi && !hasCreds)
         {
             // Let openvpn fail with a readable log line instead of feeding it
             // an empty auth file; the UI pre-checks this too.
@@ -232,6 +232,14 @@ public class VpnConnector
         args.Append("--windows-driver wintun ");
         args.Append("--pull-filter ignore \"redirect-gateway\" ");
         args.Append("--pull-filter ignore \"block-outside-dns\" ");
+        // Ignore server-pushed DNS: the pushed servers are usually reachable
+        // only through the tunnel, but Windows would use them for EVERY app
+        // on the box — including untunneled ones whose queries still egress
+        // via the LAN and therefore time out. That single misconfiguration
+        // presents as "no internet for any app the moment the VPN connects".
+        // Split-tunnel keeps host DNS; tunneled traffic still egresses via
+        // the VPN interface, only name resolution stays local.
+        args.Append("--pull-filter ignore \"dhcp-option\" ");
         args.Append($"--log \"{logFile}\" ");
         args.Append("--verb 3");
 
@@ -625,6 +633,47 @@ public class VpnConnector
     }
 
     private void Status(string msg) => StatusMessage?.Invoke(this, msg);
+
+    public static string RuntimeDir => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "VpnClient", "runtime");
+
+    public static string LogPath => Path.Combine(RuntimeDir, "openvpn.log");
+
+    /// <summary>
+    /// Last N lines of the openvpn log for the in-app viewer. Shared-read so
+    /// it works while openvpn is still writing. Caps the scan at the final
+    /// 256 KB so a multi-day verb-3 log doesn't jank the UI thread.
+    /// </summary>
+    public static string ReadLogTail(int maxLines = 400)
+    {
+        const long maxTailBytes = 256 * 1024;
+        try
+        {
+            if (!File.Exists(LogPath))
+                return "(no log yet — hit Connect first)";
+            using var fs = new FileStream(LogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            if (fs.Length > maxTailBytes)
+            {
+                fs.Seek(-maxTailBytes, SeekOrigin.End);
+            }
+            using var sr = new StreamReader(fs);
+            if (fs.Position > 0) sr.ReadLine(); // discard partial first line
+            var queue = new Queue<string>(maxLines + 1);
+            string? line;
+            while ((line = sr.ReadLine()) is not null)
+            {
+                queue.Enqueue(line);
+                while (queue.Count > maxLines) queue.Dequeue();
+            }
+            var text = string.Join(Environment.NewLine, queue);
+            return string.IsNullOrEmpty(text) ? "(log is empty)" : text;
+        }
+        catch (Exception ex)
+        {
+            return $"(cannot read log: {ex.Message})";
+        }
+    }
 
     private static int GetFreePort()
     {

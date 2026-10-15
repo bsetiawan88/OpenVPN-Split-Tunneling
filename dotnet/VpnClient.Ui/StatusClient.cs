@@ -14,6 +14,7 @@ public class StatusClient
     public const string PipeName = "vpnclient-status";
 
     public event EventHandler<Snapshot>? SnapshotReceived;
+    public event EventHandler<Vpnclient.Status.Event>? LogReceived;
     public event EventHandler<bool>? ConnectionChanged;
 
     private readonly CancellationTokenSource _cts = new();
@@ -67,6 +68,10 @@ public class StatusClient
             if (msg.BodyCase == StatusMessage.BodyOneofCase.Snapshot)
             {
                 SnapshotReceived?.Invoke(this, msg.Snapshot);
+            }
+            else if (msg.BodyCase == StatusMessage.BodyOneofCase.Event)
+            {
+                LogReceived?.Invoke(this, msg.Event);
             }
         }
     }

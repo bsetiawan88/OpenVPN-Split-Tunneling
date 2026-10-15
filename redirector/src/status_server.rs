@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
-use ipc::status::{status_message::Body, AppStats, PidStats, Snapshot, StatusMessage, Totals, VpnState};
+use ipc::status::{status_message::Body, AppStats, Event, EventKind, PidStats, Snapshot, StatusMessage, Totals, VpnState};
 use ipc::STATUS_PIPE_NAME;
 use tokio::io::AsyncWriteExt;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
@@ -28,6 +28,10 @@ pub struct StatusBus {
     /// the adapter is up but tunneled bridges have no next-hop — the UI must
     /// show amber instead of green.
     pub route_ok: Arc<std::sync::atomic::AtomicBool>,
+    /// Fan-out for activity-log events (VPN transitions, per-app admissions,
+    /// bridge open/fail). Each status-pipe client holds its own receiver;
+    /// senders never block — a lagging client drops, never stalls the hot path.
+    pub event_tx: tokio::sync::broadcast::Sender<BusEvent>,
     /// Per-PID byte counters updated by bridges.
     pub pid_bytes_out: Arc<DashMap<u32, AtomicU64>>,
     pub pid_bytes_in: Arc<DashMap<u32, AtomicU64>>,
@@ -35,13 +39,24 @@ pub struct StatusBus {
     pub pid_paths: Arc<DashMap<u32, String>>,
 }
 
+/// One activity-log record. Small by construction (short detail strings).
+#[derive(Debug, Clone)]
+pub struct BusEvent {
+    pub kind: EventKind,
+    pub detail: String,
+}
+
 impl StatusBus {
     pub fn new() -> Self {
+        // 256-deep broadcast: bursts of bridge events must not stall the
+        // divert hot path; a lagging UI client simply skips.
+        let (event_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
             bytes_out: Arc::new(AtomicU64::new(0)),
             bytes_in: Arc::new(AtomicU64::new(0)),
             vpn_up_since_ms: Arc::new(AtomicU64::new(0)),
             route_ok: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            event_tx,
             pid_bytes_out: Arc::new(DashMap::new()),
             pid_bytes_in: Arc::new(DashMap::new()),
             pid_paths: Arc::new(DashMap::new()),
@@ -60,6 +75,15 @@ impl StatusBus {
             .entry(pid)
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Fire-and-forget activity-log event. Never blocks; failures (no
+    /// receivers, lagged receivers) are silently dropped by design.
+    pub fn emit(&self, kind: EventKind, detail: impl Into<String>) {
+        let _ = self.event_tx.send(BusEvent {
+            kind,
+            detail: detail.into(),
+        });
     }
 }
 
@@ -143,32 +167,78 @@ async fn handle_client(
     let mut frame_buf = Vec::with_capacity(256);
     let mut prev_pids: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut prev_sample: Instant = Instant::now();
+    let mut events = bus.event_tx.subscribe();
+    // Drain backlog from before this client connected: only the newest few
+    // matter (e.g. "VPN up 10.8.0.5"), ancient bridge lines are noise.
+    while events.try_recv().is_ok() {}
+    let mut ticker = tokio::time::interval(TICK);
+    // Skip the immediate first tick: interval fires at once on creation and
+    // we want the first snapshot after a full TICK of counter time.
+    ticker.tick().await;
     loop {
-        frame_buf.clear();
-        let now = Instant::now();
-        let elapsed = now.duration_since(prev_sample).as_secs_f64().max(0.001);
-        let (msg, snapshot_pids) =
-            build_snapshot(&bus, &vpn_state, &prev_pids, elapsed);
-        prev_pids = snapshot_pids;
-        prev_sample = now;
-        ipc::encode_status_frame(&msg, &mut frame_buf);
-        if let Err(e) = pipe.write_all(&frame_buf).await {
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
-            ) {
-                return Ok(());
+        tokio::select! {
+            _ = ticker.tick() => {
+                frame_buf.clear();
+                let now = Instant::now();
+                let elapsed = now.duration_since(prev_sample).as_secs_f64().max(0.001);
+                let (msg, snapshot_pids) =
+                    build_snapshot(&bus, &vpn_state, &prev_pids, elapsed);
+                prev_pids = snapshot_pids;
+                prev_sample = now;
+                ipc::encode_status_frame(&msg, &mut frame_buf);
+                match write_frame(&mut pipe, &frame_buf).await? {
+                    WriteOutcome::Done => return Ok(()),
+                    WriteOutcome::Continue => {}
+                }
             }
-            return Err(e.into());
-        }
-        if let Err(e) = pipe.flush().await {
-            if matches!(e.kind(), std::io::ErrorKind::BrokenPipe) {
-                return Ok(());
+            evt = events.recv() => {
+                match evt {
+                    Ok(e) => {
+                        frame_buf.clear();
+                        let msg = StatusMessage {
+                            body: Some(Body::Event(Event {
+                                kind: e.kind as i32,
+                                detail: e.detail,
+                            })),
+                        };
+                        ipc::encode_status_frame(&msg, &mut frame_buf);
+                        match write_frame(&mut pipe, &frame_buf).await? {
+                            WriteOutcome::Done => return Ok(()),
+                            WriteOutcome::Continue => {}
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
             }
-            return Err(e.into());
         }
-        tokio::time::sleep(TICK).await;
     }
+}
+
+enum WriteOutcome {
+    Done,
+    Continue,
+}
+
+/// Write one framed message; a broken pipe maps to Done (clean disconnect).
+async fn write_frame(pipe: &mut NamedPipeServer, frame: &[u8]) -> Result<WriteOutcome> {
+    use WriteOutcome::{Continue, Done};
+    if let Err(e) = pipe.write_all(frame).await {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+        ) {
+            return Ok(Done);
+        }
+        return Err(e.into());
+    }
+    if let Err(e) = pipe.flush().await {
+        if matches!(e.kind(), std::io::ErrorKind::BrokenPipe) {
+            return Ok(Done);
+        }
+        return Err(e.into());
+    }
+    Ok(Continue)
 }
 
 fn build_snapshot(

@@ -90,14 +90,34 @@ public partial class VpnConfigWindow : FluentWindow
             UsernameBox.Text = entry.Username;
             PasswordBox.Password = entry.GetPassword();
             FilePathText.Text = entry.FilePath;
-            NeedsAuthHint.Visibility = OvpnParser.RequiresAuth(entry.FilePath)
-                ? Visibility.Visible : Visibility.Collapsed;
+            SaveHintText.Text = "";
+            UpdateAuthHint(entry.FilePath);
         }
         else
         {
             _editing = null;
             DetailGrid.Visibility = Visibility.Collapsed;
             EmptyText.Visibility = Visibility.Visible;
+        }
+    }
+
+    private void UpdateAuthHint(string filePath)
+    {
+        var mode = OvpnParser.GetAuthMode(filePath);
+        switch (mode)
+        {
+            case OvpnParser.OvpnAuthMode.None:
+                NeedsAuthHint.Visibility = Visibility.Collapsed;
+                break;
+            case OvpnParser.OvpnAuthMode.ExternalFile:
+            case OvpnParser.OvpnAuthMode.Inline:
+                NeedsAuthHint.Visibility = Visibility.Visible;
+                NeedsAuthHint.Text = "Uses auth from the .ovpn itself — no username/password needed.";
+                break;
+            default:
+                NeedsAuthHint.Visibility = Visibility.Visible;
+                NeedsAuthHint.Text = "This profile requires username + password.";
+                break;
         }
     }
 
@@ -113,34 +133,16 @@ public partial class VpnConfigWindow : FluentWindow
         current.SetPassword(PasswordBox.Password);
         Persist();
 
+        SaveHintText.Text = $"Saved ✓ {DateTime.Now:HH:mm:ss}";
+
         // OvpnEntry isn't observable; force the ListView to re-render in place.
         ProfileList.Items.Refresh();
-    }
-
-    private void ClearCredsBtn_Click(object sender, RoutedEventArgs e)
-    {
-        if (_editing is null) return;
-        var result = System.Windows.MessageBox.Show(
-            $"Clear saved username/password for \"{_editing.DisplayName}\"?\n" +
-            "The .ovpn file itself stays in the OpenVPN config folder.",
-            "Clear credentials",
-            System.Windows.MessageBoxButton.YesNo,
-            System.Windows.MessageBoxImage.Question);
-        if (result != System.Windows.MessageBoxResult.Yes) return;
-
-        _editing.Username = "";
-        _editing.SetPassword("");
-        _editing.ServerOverride = "";
-        UsernameBox.Text = "";
-        PasswordBox.Password = "";
-        ServerOverrideBox.Text = "";
-        Persist();
     }
 
     private async void ConnectProfileBtn_Click(object sender, RoutedEventArgs e)
     {
         if (_editing is null) return;
-        if (OvpnParser.RequiresAuth(_editing.FilePath)
+        if (OvpnParser.NeedsUiCredentials(_editing.FilePath)
             && (string.IsNullOrWhiteSpace(_editing.Username)
                 || string.IsNullOrWhiteSpace(_editing.GetPassword())))
         {

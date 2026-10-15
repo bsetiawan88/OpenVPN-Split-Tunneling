@@ -74,6 +74,13 @@ enum EventKind {
   POLICY_PID_REMOVED = 4;
   BRIDGE_OPENED     = 5;
   BRIDGE_CLOSED     = 6;
+  // Activity-log events for the in-app log panel (added later; numeric
+  // stability of 0-6 preserved for any deployed mixed-version pairs).
+  APP_ADMITTED      = 7;   // tunneled app PID admitted (path match or child)
+  BRIDGE_FAILED     = 8;   // tunneled connect() failed, with reason
+  ROUTE_INSTALLED   = 9;   // split-tunnel 0.0.0.0/0 route installed
+  ROUTE_MISSING     = 10;  // adapter up but route install failed
+  VPN_CHANGED       = 11;  // tunnel moved to a new adapter IP/ifindex
 }
 
 message Command {

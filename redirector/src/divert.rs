@@ -20,6 +20,7 @@ use crate::adapter::VpnTarget;
 use crate::flows::{self, FlowEntry, FlowTable, LocalEndpoint, PROTO_TCP, PROTO_UDP};
 use crate::pidlookup;
 use crate::policy::{self, PolicyState};
+use ipc::status::EventKind;
 use crate::process::Resolver;
 use crate::stack::VirtualDevice;
 use crate::status_server::StatusBus;
@@ -108,7 +109,7 @@ pub fn run(
         let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
         drain_tx(&mut device, &inject, &stats);
 
-        service_tcp_flows(&mut tcp_flows, &mut sockets, &tokio_handle, now_vpn, &stats);
+        service_tcp_flows(&mut tcp_flows, &mut sockets, &tokio_handle, now_vpn, &stats, &bus);
         service_udp_flows(&mut udp_flows, &inject, &stats);
 
         let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
@@ -184,6 +185,7 @@ struct UdpKey {
 struct TcpFlow {
     handle: SocketHandle,
     pid: u32,
+    exe: String,
     original_dst: SocketAddr,
     state: TcpState,
 }
@@ -205,6 +207,18 @@ struct UdpFlow {
     app_to_remote: mpsc::Sender<Vec<u8>>,
     remote_to_app: mpsc::Receiver<Vec<u8>>,
     last_active: Instant,
+}
+
+/// Cap event detail length: anyhow chains can be long, the log panel only
+/// shows one line per event.
+fn short(s: &str) -> String {
+    const MAX: usize = 180;
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(MAX).collect();
+    out.push('…');
+    out
 }
 
 /// Resolve the owning PID for a freshly-seen flow. The fast path is the
@@ -301,6 +315,10 @@ fn handle_capture(
                         "auto-tunnel (packet): pid={} matches {}",
                         p, info.exe_path
                     );
+                    bus.emit(
+                        EventKind::AppAdmitted,
+                        format!("\"{}\" (pid {}) admitted — path match, connecting to {}:{}", info.exe_name, p, dst_ip, dst_port),
+                    );
                     policy::add(policy_state, p);
                     bus.pid_paths.insert(p, info.exe_path);
                     true
@@ -309,6 +327,13 @@ fn handle_capture(
                         tracing::info!(
                             "auto-tunnel (packet child): pid={} parent={} exe={}",
                             p, ppid, info.exe_path
+                        );
+                        bus.emit(
+                            EventKind::AppAdmitted,
+                            format!(
+                                "\"{}\" (pid {}) admitted — child of pid {}, connecting to {}:{}",
+                                info.exe_name, p, ppid, dst_ip, dst_port
+                            ),
                         );
                         policy::add(policy_state, p);
                         bus.pid_paths.insert(p, info.exe_path);
@@ -327,6 +352,10 @@ fn handle_capture(
                         tracing::info!(
                             "auto-tunnel (packet child, no exe): pid={} parent={}",
                             p, ppid
+                        );
+                        bus.emit(
+                            EventKind::AppAdmitted,
+                            format!("pid {} admitted — child of pid {}, connecting to {}:{}", p, ppid, dst_ip, dst_port),
                         );
                         policy::add(policy_state, p);
                         true
@@ -370,11 +399,16 @@ fn handle_capture(
                 return;
             }
             let handle = sockets.add(sock);
+            let exe = resolver
+                .resolve(pid)
+                .map(|i| i.exe_name)
+                .unwrap_or_else(|| format!("pid {}", pid));
             tcp_flows.insert(
                 key,
                 TcpFlow {
                     handle,
                     pid,
+                    exe,
                     original_dst: SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port)),
                     state: TcpState::Pending,
                 },
@@ -401,10 +435,26 @@ fn handle_capture(
                 pid, src_ip, src_port, dst_ip, dst_port
             );
 
+            let exe = resolver
+                .resolve(pid)
+                .map(|i| i.exe_name)
+                .unwrap_or_else(|| format!("pid {}", pid));
+            bus.emit(
+                EventKind::BridgeOpened,
+                format!(
+                    "UDP \"{}\" (pid {}) {}:{} -> {}:{} via VPN",
+                    exe, pid, src_ip, src_port, dst_ip, dst_port
+                ),
+            );
+
             let dst = SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port));
+            let bus_fail = bus.clone();
+            let fail_exe = exe.clone();
             tokio_handle.spawn(async move {
                 if let Err(e) = udp_bridge(dst, vpn_target, a2r_rx, r2a_tx).await {
-                    tracing::warn!("udp bridge to {} failed: {:#}", dst, e);
+                    let detail = format!("UDP \"{}\" (pid {}) to {} failed: {}", fail_exe, pid, dst, short(&e.to_string()));
+                    tracing::warn!("{}", detail);
+                    bus_fail.emit(EventKind::BridgeFailed, detail);
                 }
             });
             stats.bridges_opened.fetch_add(1, Ordering::Relaxed);
@@ -468,6 +518,7 @@ fn service_tcp_flows(
     tokio_handle: &tokio::runtime::Handle,
     vpn_target: Option<VpnTarget>,
     stats: &Stats,
+    bus: &Arc<StatusBus>,
 ) {
     let mut to_remove = Vec::new();
     for (key, flow) in tcp_flows.iter_mut() {
@@ -482,11 +533,24 @@ fn service_tcp_flows(
                         "tcp bridge open: pid={} {}:{} -> {}",
                         flow.pid, key.src_ip, key.src_port, flow.original_dst
                     );
+                    bus.emit(
+                        EventKind::BridgeOpened,
+                        format!(
+                            "TCP \"{}\" (pid {}) {}:{} -> {} via VPN",
+                            flow.exe, flow.pid, key.src_ip, key.src_port, flow.original_dst
+                        ),
+                    );
 
                     let dst = flow.original_dst;
+                    let bus_fail = bus.clone();
+                    let fail_exe = flow.exe.clone();
+                    let fail_pid = flow.pid;
                     tokio_handle.spawn(async move {
                         if let Err(e) = tcp_bridge(dst, vpn_target, a2r_rx, r2a_tx).await {
-                            tracing::warn!("tcp bridge to {} failed: {:#}", dst, e);
+                            let detail =
+                                format!("TCP \"{}\" (pid {}) to {} failed: {}", fail_exe, fail_pid, dst, short(&e.to_string()));
+                            tracing::warn!("{}", detail);
+                            bus_fail.emit(EventKind::BridgeFailed, detail);
                         }
                     });
                     stats.bridges_opened.fetch_add(1, Ordering::Relaxed);

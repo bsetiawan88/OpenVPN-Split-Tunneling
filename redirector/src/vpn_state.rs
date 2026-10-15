@@ -7,6 +7,7 @@ use anyhow::Result;
 
 use crate::adapter::{self, VpnTarget};
 use crate::status_server::StatusBus;
+use ipc::status::EventKind;
 
 pub type VpnState = Arc<RwLock<Option<VpnTarget>>>;
 
@@ -38,27 +39,48 @@ pub async fn watcher(state: VpnState, bus: Arc<StatusBus>) -> Result<()> {
                 (None, Some(t)) => {
                     tracing::info!("VPN adapter UP at {} (ifindex {})", t.ipv4, t.if_index);
                     bus.vpn_up_since_ms.store(unix_millis(), Ordering::Relaxed);
+                    bus.emit(
+                        EventKind::VpnUp,
+                        format!("VPN adapter up at {} (ifindex {})", t.ipv4, t.if_index),
+                    );
                     last_gateway = ensure_split_tunnel_route(t).await;
                     bus.route_ok.store(
                         last_gateway.is_some(),
                         std::sync::atomic::Ordering::Relaxed,
                     );
-                    if last_gateway.is_none() {
-                        // No route installed — tunneled bridges would fail with
-                        // "network unreachable". Keep the VPN marked up (the
-                        // adapter IS up) but flag route_ok=false so the UI
-                        // shows amber instead of green. Retried below while
-                        // the adapter stays up.
-                        tracing::error!(
-                            "split-tunnel route NOT installed for {} — tunneled apps will have no connectivity until the route is in place",
-                            t.ipv4
-                        );
+                    match last_gateway {
+                        Some(gw) => bus.emit(
+                            EventKind::RouteInstalled,
+                            format!("split-tunnel route via {} installed", gw),
+                        ),
+                        None => {
+                            bus.emit(
+                                EventKind::RouteMissing,
+                                format!(
+                                    "split-tunnel route NOT installed for {} — tunneled apps have no path, retrying",
+                                    t.ipv4
+                                ),
+                            );
+                            // No route installed — tunneled bridges would fail with
+                            // "network unreachable". Keep the VPN marked up (the
+                            // adapter IS up) but flag route_ok=false so the UI
+                            // shows amber instead of green. Retried below while
+                            // the adapter stays up.
+                            tracing::error!(
+                                "split-tunnel route NOT installed for {} — tunneled apps will have no connectivity until the route is in place",
+                                t.ipv4
+                            );
+                        }
                     }
                 }
                 (Some(old), None) => {
                     tracing::warn!("VPN adapter DOWN (was {})", old.ipv4);
                     bus.vpn_up_since_ms.store(0, Ordering::Relaxed);
                     bus.route_ok.store(true, std::sync::atomic::Ordering::Relaxed);
+                    bus.emit(
+                        EventKind::VpnDown,
+                        format!("VPN adapter down (was {})", old.ipv4),
+                    );
                     if let Some(gw) = last_gateway.take() {
                         remove_split_tunnel_route(gw, old.if_index).await;
                     }
@@ -69,6 +91,13 @@ pub async fn watcher(state: VpnState, bus: Arc<StatusBus>) -> Result<()> {
                         old.ipv4, old.if_index, new.ipv4, new.if_index
                     );
                     bus.vpn_up_since_ms.store(unix_millis(), Ordering::Relaxed);
+                    bus.emit(
+                        EventKind::VpnChanged,
+                        format!(
+                            "VPN moved {} (ifindex {}) -> {} (ifindex {}), recycling tunneled flows",
+                            old.ipv4, old.if_index, new.ipv4, new.if_index
+                        ),
+                    );
                     if let Some(gw) = last_gateway.take() {
                         remove_split_tunnel_route(gw, old.if_index).await;
                     }
@@ -77,6 +106,19 @@ pub async fn watcher(state: VpnState, bus: Arc<StatusBus>) -> Result<()> {
                         last_gateway.is_some(),
                         std::sync::atomic::Ordering::Relaxed,
                     );
+                    match last_gateway {
+                        Some(gw) => bus.emit(
+                            EventKind::RouteInstalled,
+                            format!("split-tunnel route via {} installed", gw),
+                        ),
+                        None => bus.emit(
+                            EventKind::RouteMissing,
+                            format!(
+                                "split-tunnel route NOT installed for {} — tunneled apps have no path, retrying",
+                                new.ipv4
+                            ),
+                        ),
+                    }
                 }
                 _ => {}
             }
@@ -93,10 +135,17 @@ pub async fn watcher(state: VpnState, bus: Arc<StatusBus>) -> Result<()> {
                     t.ipv4
                 );
                 last_gateway = ensure_split_tunnel_route(t).await;
-                bus.route_ok.store(
-                    last_gateway.is_some(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                let ok = last_gateway.is_some();
+                bus.route_ok.store(ok, std::sync::atomic::Ordering::Relaxed);
+                if ok {
+                    bus.emit(
+                        EventKind::RouteInstalled,
+                        format!(
+                            "split-tunnel route via {} installed (retry)",
+                            last_gateway.unwrap()
+                        ),
+                    );
+                }
             }
         }
         tokio::time::sleep(POLL_INTERVAL).await;

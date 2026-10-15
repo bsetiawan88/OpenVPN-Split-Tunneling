@@ -18,6 +18,9 @@ public class Config
     /// <summary>Rotate interval in minutes. Clamped to 5..720 on load.</summary>
     public int RotateIntervalMinutes { get; set; } = 30;
 
+    /// <summary>Show the activity-log panel on the main window.</summary>
+    public bool LoggingEnabled { get; set; } = false;
+
     [JsonIgnore]
     public static string AppDataDir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VpnClient");

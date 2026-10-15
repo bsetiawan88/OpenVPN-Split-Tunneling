@@ -171,17 +171,25 @@
                                       Margin="0,4,0,0" />
                     </StackPanel>
 
-                    <StackPanel Grid.Row="7" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
-                        <ui:Button x:Name="ClearCredsBtn"
-                                   Content="Clear credentials"
-                                   Click="ClearCredsBtn_Click"
-                                   Margin="0,0,8,0" />
-                        <ui:Button x:Name="SaveBtn"
-                                   Content="Save"
-                                   Icon="{ui:SymbolIcon Save20}"
-                                   Appearance="Primary"
-                                   Click="SaveBtn_Click" />
-                    </StackPanel>
+                    <Grid Grid.Row="7" Margin="0,16,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <ui:TextBlock Grid.Column="0"
+                                      x:Name="SaveHintText"
+                                      Text=""
+                                      FontTypography="Caption"
+                                      Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                                      VerticalAlignment="Center" />
+                        <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
+                            <ui:Button x:Name="SaveBtn"
+                                       Content="Save"
+                                       Icon="{ui:SymbolIcon Save20}"
+                                       Appearance="Primary"
+                                       Click="SaveBtn_Click" />
+                        </StackPanel>
+                    </Grid>
                 </Grid>
 
                 <ui:TextBlock x:Name="EmptyText"

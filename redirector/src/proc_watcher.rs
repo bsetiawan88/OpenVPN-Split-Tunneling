@@ -9,6 +9,7 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use crate::policy::{self, PolicyState};
 use crate::status_server::StatusBus;
 use crate::tunneled::{self, TunneledPaths};
+use ipc::status::EventKind;
 
 // We still poll, but the *primary* admission path is now in divert.rs (it
 // admits PIDs the instant their first packet shows up). This watcher exists
@@ -49,6 +50,17 @@ pub async fn run(
             if auto_tunneled.contains(&pid_u32) {
                 continue;
             }
+            // Already admitted via the packet-time path (divert.rs) — record
+            // without re-emitting, otherwise every poll duplicates the log.
+            if policy::contains(&policy_state, pid_u32) {
+                if let Some(exe) = process.exe() {
+                    bus.pid_paths
+                        .entry(pid_u32)
+                        .or_insert_with(|| exe.to_string_lossy().to_string());
+                }
+                auto_tunneled.insert(pid_u32);
+                continue;
+            }
             // Child-process inheritance: anything spawned by an already
             // tunneled PID is tunneled too, even when the child exe path is
             // NOT in the user's list (launcher -> game is the classic case).
@@ -68,8 +80,17 @@ pub async fn run(
                     );
                     policy::add(&policy_state, pid_u32);
                     if !path_str.is_empty() {
-                        bus.pid_paths.insert(pid_u32, path_str);
+                        bus.pid_paths.insert(pid_u32, path_str.clone());
                     }
+                    bus.emit(
+                        EventKind::AppAdmitted,
+                        format!(
+                            "\"{}\" (pid {}) admitted — child of pid {}",
+                            exe_name_of(&path_str, pid_u32),
+                            pid_u32,
+                            parent_u32
+                        ),
+                    );
                     auto_tunneled.insert(pid_u32);
                     continue;
                 }
@@ -81,7 +102,15 @@ pub async fn run(
             let path_str = exe.to_string_lossy().to_string();
             tracing::info!("auto-tunnel (poll): pid={} matches {:?}", pid_u32, exe);
             policy::add(&policy_state, pid_u32);
-            bus.pid_paths.insert(pid_u32, path_str);
+            bus.pid_paths.insert(pid_u32, path_str.clone());
+            bus.emit(
+                EventKind::AppAdmitted,
+                format!(
+                    "\"{}\" (pid {}) admitted — path match",
+                    exe_name_of(&path_str, pid_u32),
+                    pid_u32
+                ),
+            );
             auto_tunneled.insert(pid_u32);
         }
 
@@ -103,4 +132,15 @@ fn path_matches_any(candidate: &std::path::Path, list: &[PathBuf]) -> bool {
     let candidate_lower = candidate.to_string_lossy().to_lowercase();
     list.iter()
         .any(|p| p.to_string_lossy().to_lowercase() == candidate_lower)
+}
+
+/// Display name for log events: file name when known, else "pid N".
+fn exe_name_of(path_str: &str, pid: u32) -> String {
+    if path_str.is_empty() {
+        return format!("pid {}", pid);
+    }
+    std::path::Path::new(path_str)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("pid {}", pid))
 }
