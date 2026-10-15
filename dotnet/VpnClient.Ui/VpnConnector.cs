@@ -790,6 +790,29 @@ public class VpnConnector
 
     public static string LogPath => Path.Combine(RuntimeDir, "openvpn.log");
 
+    /// <summary>Redirector's persistent activity log (same lines as the
+    /// in-app Activity panel). Cleared on every app start.</summary>
+    public static string ActivityLogPath => Path.Combine(RuntimeDir, "activity.log");
+
+    /// <summary>
+    /// Fresh logs per app start: deletes stale activity.log + openvpn.log so
+    /// a saved file always belongs to exactly one session. Called once from
+    /// App.OnStartup, before the redirector is (re)started. Never throws.
+    /// (openvpn.log is additionally truncated on every connect inside
+    /// StartOpenVpnAsync so AUTH_FAILED tails can't leak across runs.)
+    /// </summary>
+    public static void ClearLogsOnAppStart()
+    {
+        foreach (var path in new[] { ActivityLogPath, LogPath })
+        {
+            try
+            {
+                if (File.Exists(path)) File.Delete(path);
+            }
+            catch { }
+        }
+    }
+
     /// <summary>
     /// Last N lines of the openvpn log for the in-app viewer. Shared-read so
     /// it works while openvpn is still writing. Caps the scan at the final

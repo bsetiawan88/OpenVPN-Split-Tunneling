@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -37,7 +38,46 @@ pub struct StatusBus {
     pub pid_bytes_in: Arc<DashMap<u32, AtomicU64>>,
     /// PID → canonical exe path, populated by proc_watcher.
     pub pid_paths: Arc<DashMap<u32, String>>,
+    /// Persistent activity log (same lines the UI panel shows). The UI
+    /// clears it on app start; the redirector only appends (plus a marker
+    /// per redirector start) so evidence survives UI restarts/crashes.
+    /// Mutex because emit() fires from the divert loop AND spawned bridge
+    /// tasks. None when the runtime dir is unavailable — logging must never
+    /// break the hot path.
+    activity_log: Mutex<Option<std::fs::File>>,
 }
+
+/// %LocalAppData%\VpnClient\runtime\activity.log — next to mode.txt and
+/// openvpn.log. Shared convention with the UI (VpnConnector.ActivityLogPath).
+fn activity_log_path() -> Option<PathBuf> {
+    let local = std::env::var("LOCALAPPDATA").ok()?;
+    Some(
+        PathBuf::from(local)
+            .join("VpnClient")
+            .join("runtime")
+            .join("activity.log"),
+    )
+}
+
+fn local_timestamp() -> String {
+    // windows crate is already a dependency; no chrono needed for one line.
+    // (GetLocalTime returns SYSTEMTIME by value; the type lives in Foundation.)
+    let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        st.wYear,
+        st.wMonth,
+        st.wDay,
+        st.wHour,
+        st.wMinute,
+        st.wSecond,
+        st.wMilliseconds
+    )
+}
+
+/// ~8 MB cap: activity storms (opencode spawns hundreds of tools) must not
+/// fill the disk. Truncates with a marker; total loss bounded, recency kept.
+const ACTIVITY_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// One activity-log record. Small by construction (short detail strings).
 #[derive(Debug, Clone)]
@@ -51,7 +91,8 @@ impl StatusBus {
         // 256-deep broadcast: bursts of bridge events must not stall the
         // divert hot path; a lagging UI client simply skips.
         let (event_tx, _) = tokio::sync::broadcast::channel(256);
-        Self {
+        let activity_log = Mutex::new(open_activity_log());
+        let bus = Self {
             bytes_out: Arc::new(AtomicU64::new(0)),
             bytes_in: Arc::new(AtomicU64::new(0)),
             vpn_up_since_ms: Arc::new(AtomicU64::new(0)),
@@ -60,7 +101,12 @@ impl StatusBus {
             pid_bytes_out: Arc::new(DashMap::new()),
             pid_bytes_in: Arc::new(DashMap::new()),
             pid_paths: Arc::new(DashMap::new()),
-        }
+            activity_log,
+        };
+        // Marker (appended, never truncating): one UI session can restart
+        // the redirector, and the earlier evidence must survive that.
+        bus.append_activity_line("Redirector", "redirector started — appending to activity log");
+        bus
     }
 
     pub fn add_pid_out(&self, pid: u32, n: u64) {
@@ -78,13 +124,60 @@ impl StatusBus {
     }
 
     /// Fire-and-forget activity-log event. Never blocks; failures (no
-    /// receivers, lagged receivers) are silently dropped by design.
+    /// receivers, lagging receivers) are silently dropped by design.
+    /// Also appended to activity.log (best effort) so the session is
+    /// analyzable from disk after the fact.
     pub fn emit(&self, kind: EventKind, detail: impl Into<String>) {
+        let detail = detail.into();
         let _ = self.event_tx.send(BusEvent {
             kind,
-            detail: detail.into(),
+            detail: detail.clone(),
         });
+        self.append_activity_line(&format!("{:?}", kind), &detail);
     }
+
+    fn append_activity_line(&self, kind: &str, detail: &str) {
+        use std::io::Write;
+        let Ok(mut guard) = self.activity_log.lock() else {
+            return;
+        };
+        let Some(file) = guard.as_mut() else {
+            return;
+        };
+        // Rotate by truncation (single file, no rename dance while held).
+        if file.metadata().map(|m| m.len()).unwrap_or(0) > ACTIVITY_LOG_MAX_BYTES {
+            let _ = file.set_len(0);
+            use std::io::Seek;
+            let _ = file.seek(std::io::SeekFrom::Start(0));
+            let _ = writeln!(
+                file,
+                "[{}] [Redirector] activity.log rotated (>8MB) — older lines discarded",
+                local_timestamp()
+            );
+        }
+        let _ = writeln!(file, "[{}] [{}] {}", local_timestamp(), kind, oneline(detail));
+        let _ = file.flush();
+    }
+}
+
+/// One line per event: flatten embedded newlines so post-mortem parsing
+/// (and the UI panel) never sees a multi-line record.
+fn oneline(s: &str) -> String {
+    s.replace("\r\n", " | ").replace('\n', " | ").replace('\r', " | ")
+}
+
+/// Open (creating dirs) the activity log in append mode. None on any
+/// failure — every caller treats logging as best-effort.
+fn open_activity_log() -> Option<std::fs::File> {
+    let path = activity_log_path()?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
 }
 
 struct SecurityDescriptor {
