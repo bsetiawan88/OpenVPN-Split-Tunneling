@@ -29,3 +29,7 @@
 # OS noise
 Thumbs.db
 .DS_Store
+
+# Local portable build output (reproducible via cargo build + dotnet publish).
+# Do not commit binaries.
+/dist/

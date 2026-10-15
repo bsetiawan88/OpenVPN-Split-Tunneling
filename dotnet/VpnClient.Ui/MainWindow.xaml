@@ -25,6 +25,7 @@
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
             </Grid.RowDefinitions>
 
@@ -60,7 +61,7 @@
                         <ui:Button x:Name="VpnSettingsBtn"
                                    Icon="{ui:SymbolIcon Settings20}"
                                    Appearance="Secondary"
-                                   ToolTip="VPN profiles &amp; .ovpn imports"
+                                   ToolTip="VPN profiles &amp; credentials (reads C:\Program Files\OpenVPN\config)"
                                    Click="VpnSettingsBtn_Click"
                                    Margin="0,0,8,0" />
                         <ui:Button x:Name="ConnectBtn"
@@ -75,7 +76,39 @@
             </Border>
 
             <!-- Stats row -->
-            <Grid Grid.Row="1" Margin="0,16,0,0">
+            <Border Grid.Row="1" Margin="0,16,0,0"
+                    Background="{DynamicResource ControlFillColorDefaultBrush}"
+                    CornerRadius="8"
+                    Padding="20,12">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="12" />
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="12" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <CheckBox Grid.Column="0"
+                              x:Name="RotateCheck"
+                              Content="Rotate every"
+                              Checked="RotateCheck_Changed"
+                              Unchecked="RotateCheck_Changed"
+                              VerticalAlignment="Center" />
+                    <ComboBox Grid.Column="2"
+                              x:Name="RotateIntervalBox"
+                              Width="110"
+                              VerticalAlignment="Center"
+                              SelectionChanged="RotateIntervalBox_SelectionChanged" />
+                    <ui:TextBlock Grid.Column="4"
+                                  x:Name="RotateHintText"
+                                  Text="Rotate off"
+                                  FontTypography="Caption"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  VerticalAlignment="Center" />
+                </Grid>
+            </Border>
+
+            <Grid Grid.Row="2" Margin="0,16,0,0">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="16" />
@@ -105,7 +138,7 @@
             </Grid>
 
             <!-- Apps section -->
-            <Border Grid.Row="2"
+            <Border Grid.Row="3"
                     Margin="0,16,0,0"
                     Background="{DynamicResource ControlFillColorDefaultBrush}"
                     CornerRadius="8"

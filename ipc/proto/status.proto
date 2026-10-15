@@ -32,6 +32,7 @@ message VpnState {
   string adapter_ip = 2;          // empty when down
   uint64 uptime_ms = 3;           // 0 when down
   string adapter_name = 4;        // friendly name when known
+  bool   route_ok = 5;           // split-tunnel 0.0.0.0/0 route installed; false => tunneled apps have no path
 }
 
 message Totals {

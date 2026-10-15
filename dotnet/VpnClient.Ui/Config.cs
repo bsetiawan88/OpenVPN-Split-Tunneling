@@ -12,15 +12,18 @@ public class Config
     public string? ActiveOvpnId { get; set; }
     public List<AppEntry> TunneledApps { get; set; } = new();
 
+    /// <summary>Rotate VPN profile on a timer (round-robin through discovered .ovpn files).</summary>
+    public bool RotateEnabled { get; set; } = false;
+
+    /// <summary>Rotate interval in minutes. Clamped to 5..720 on load.</summary>
+    public int RotateIntervalMinutes { get; set; } = 30;
+
     [JsonIgnore]
     public static string AppDataDir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VpnClient");
 
     [JsonIgnore]
     public static string ConfigPath => Path.Combine(AppDataDir, "config.json");
-
-    [JsonIgnore]
-    public static string OvpnDir => Path.Combine(AppDataDir, "ovpn");
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -54,29 +57,65 @@ public class Config
     /// <summary>
     /// Drop any legacy "host:port" stored under ServerHostname down to just the host.
     /// We now display hostname-only to match OpenVPN Connect's convention.
+    /// Also clamps the rotate interval into range.
     /// </summary>
     private void MigrateInPlace()
     {
         var dirty = false;
         foreach (var entry in OvpnFiles)
         {
-            var idx = entry.ServerHostname.IndexOf(':');
-            if (idx > 0)
+            // Strip legacy "host:port" down to host. Guard bracketed/bare
+            // IPv6 (multiple colons) — truncating those would corrupt them.
+            var h = entry.ServerHostname;
+            if (!string.IsNullOrEmpty(h) && h.IndexOf(':') == h.LastIndexOf(':'))
             {
-                entry.ServerHostname = entry.ServerHostname[..idx];
-                dirty = true;
+                var idx = h.IndexOf(':');
+                if (idx > 0)
+                {
+                    entry.ServerHostname = h[..idx];
+                    dirty = true;
+                }
             }
         }
+        if (RotateIntervalMinutes < 5) { RotateIntervalMinutes = 5; dirty = true; }
+        if (RotateIntervalMinutes > 720) { RotateIntervalMinutes = 720; dirty = true; }
         if (dirty)
         {
             try { Save(); } catch { }
         }
     }
 
+    /// <summary>
+    /// Reconcile saved credentials/overrides with the .ovpn files actually on
+    /// disk under the OpenVPN config dir. Files are the source of truth; the
+    /// JSON store only keeps per-file credentials + server override.
+    /// </summary>
+    public void RefreshFromDisk()
+    {
+        try
+        {
+            var scanned = OpenVpnConfigSource.Scan(OvpnFiles);
+            OvpnFiles = scanned;
+            if (!string.IsNullOrEmpty(ActiveOvpnId)
+                && OvpnFiles.All(p => p.Id != ActiveOvpnId))
+            {
+                ActiveOvpnId = OvpnFiles.FirstOrDefault()?.Id;
+            }
+            if (string.IsNullOrEmpty(ActiveOvpnId))
+            {
+                ActiveOvpnId = OvpnFiles.FirstOrDefault()?.Id;
+            }
+            Save();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"config refresh-from-disk failed: {ex.Message}");
+        }
+    }
+
     public void Save()
     {
         Directory.CreateDirectory(AppDataDir);
-        Directory.CreateDirectory(OvpnDir);
         var json = JsonSerializer.Serialize(this, JsonOpts);
         File.WriteAllText(ConfigPath, json);
     }

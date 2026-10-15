@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -72,12 +73,24 @@ public static class Redirector
             var candidate = Path.Combine(here, "redirector.exe");
             if (File.Exists(candidate)) return candidate;
         }
-        // 2. Workspace builds, release first (that's what we ship out of CI)
-        foreach (var dev in new[]
+        // 2. Workspace builds, release first (that's what we ship out of CI).
+        //    Resolve relative to this assembly so forks/clones at any path work.
+        var asmDir = Path.GetDirectoryName(Environment.ProcessPath);
+        var candidates = new List<string>();
+        if (asmDir is not null)
         {
-            @"C:\Projects\vpn\target\release\redirector.exe",
-            @"C:\Projects\vpn\target\debug\redirector.exe",
-        })
+            var dir = new DirectoryInfo(asmDir);
+            for (int i = 0; i < 6 && dir is not null; i++)
+            {
+                candidates.Add(Path.Combine(dir.FullName, "target", "release", "redirector.exe"));
+                candidates.Add(Path.Combine(dir.FullName, "target", "debug", "redirector.exe"));
+                dir = dir.Parent;
+            }
+        }
+        // 3. Legacy absolute fallback (old dev machine layout).
+        candidates.Add(@"C:\Projects\vpn\target\release\redirector.exe");
+        candidates.Add(@"C:\Projects\vpn\target\debug\redirector.exe");
+        foreach (var dev in candidates)
         {
             if (File.Exists(dev)) return dev;
         }

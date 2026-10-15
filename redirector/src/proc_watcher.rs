@@ -49,6 +49,31 @@ pub async fn run(
             if auto_tunneled.contains(&pid_u32) {
                 continue;
             }
+            // Child-process inheritance: anything spawned by an already
+            // tunneled PID is tunneled too, even when the child exe path is
+            // NOT in the user's list (launcher -> game is the classic case).
+            // This closes the "koneksi tidak berjalan untuk aplikasi" gap
+            // where the user lists the launcher but the real traffic comes
+            // from a child with a different exe name.
+            if let Some(parent) = process.parent() {
+                let parent_u32 = parent.as_u32();
+                if policy::contains(&policy_state, parent_u32) {
+                    let path_str = process
+                        .exe()
+                        .map(|e| e.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    tracing::info!(
+                        "auto-tunnel (child): pid={} parent={} exe={:?}",
+                        pid_u32, parent_u32, process.exe()
+                    );
+                    policy::add(&policy_state, pid_u32);
+                    if !path_str.is_empty() {
+                        bus.pid_paths.insert(pid_u32, path_str);
+                    }
+                    auto_tunneled.insert(pid_u32);
+                    continue;
+                }
+            }
             let Some(exe) = process.exe() else { continue };
             if !path_matches_any(exe, &paths) {
                 continue;

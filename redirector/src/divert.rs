@@ -124,6 +124,18 @@ fn on_vpn_change(
     sockets: &mut SocketSet<'static>,
     stats: &Stats,
 ) {
+    // Any target change (down OR new IP/ifindex after rotate/reconnect)
+    // invalidates existing bridges: their sockets are bound to the old
+    // interface address / IP_UNICAST_IF index and would go dead. Drain them
+    // so apps reconnect through the fresh tunnel on their next SYN.
+    let changed = match (prev, now) {
+        (Some(a), Some(b)) => a != b,
+        (None, None) => false,
+        _ => true,
+    };
+    if !changed {
+        return;
+    }
     if prev.is_some() && now.is_none() {
         let tcp_n = tcp_flows.len();
         let udp_n = udp_flows.len();
@@ -133,6 +145,17 @@ fn on_vpn_change(
                 tcp_n, udp_n
             );
         }
+    } else if let (Some(old), Some(new)) = (prev, now) {
+        let tcp_n = tcp_flows.len();
+        let udp_n = udp_flows.len();
+        if tcp_n + udp_n > 0 {
+            tracing::warn!(
+                "VPN target changed {} (ifindex {}) -> {} (ifindex {}) — recycling {} TCP + {} UDP tunneled flows",
+                old.ipv4, old.if_index, new.ipv4, new.if_index, tcp_n, udp_n
+            );
+        }
+    }
+    if prev.is_some() {
         for (_, flow) in tcp_flows.drain() {
             sockets.remove(flow.handle);
             stats.bridges_closed.fetch_add(1, Ordering::Relaxed);
@@ -267,7 +290,8 @@ fn handle_capture(
     //      (this is the path that closes the proc_watcher race — fast
     //      launchers like STOVE make their first connection before any
     //      polling tick would catch them)
-    //   3. otherwise → pass through to the default route
+    //   3. PID is a child of a tunneled PID → inherit (launcher -> game)
+    //   4. otherwise → pass through to the default route
     let is_tunneled = match pid {
         Some(p) if policy::contains(policy_state, p) => true,
         Some(p) => {
@@ -280,11 +304,35 @@ fn handle_capture(
                     policy::add(policy_state, p);
                     bus.pid_paths.insert(p, info.exe_path);
                     true
+                } else if let Some(ppid) = resolver.parent_of(p) {
+                    if policy::contains(policy_state, ppid) {
+                        tracing::info!(
+                            "auto-tunnel (packet child): pid={} parent={} exe={}",
+                            p, ppid, info.exe_path
+                        );
+                        policy::add(policy_state, p);
+                        bus.pid_paths.insert(p, info.exe_path);
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
             } else {
-                false
+                // No exe path (yet) — still check parent inheritance so
+                // short-lived children of tunneled parents don't escape.
+                match resolver.parent_of(p) {
+                    Some(ppid) if policy::contains(policy_state, ppid) => {
+                        tracing::info!(
+                            "auto-tunnel (packet child, no exe): pid={} parent={}",
+                            p, ppid
+                        );
+                        policy::add(policy_state, p);
+                        true
+                    }
+                    _ => false,
+                }
             }
         }
         None => false,

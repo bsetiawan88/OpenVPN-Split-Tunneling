@@ -24,6 +24,10 @@ pub struct StatusBus {
     pub bytes_out: Arc<AtomicU64>,
     pub bytes_in: Arc<AtomicU64>,
     pub vpn_up_since_ms: Arc<AtomicU64>,
+    /// True when the high-metric split-tunnel route is installed. False means
+    /// the adapter is up but tunneled bridges have no next-hop — the UI must
+    /// show amber instead of green.
+    pub route_ok: Arc<std::sync::atomic::AtomicBool>,
     /// Per-PID byte counters updated by bridges.
     pub pid_bytes_out: Arc<DashMap<u32, AtomicU64>>,
     pub pid_bytes_in: Arc<DashMap<u32, AtomicU64>>,
@@ -37,6 +41,7 @@ impl StatusBus {
             bytes_out: Arc::new(AtomicU64::new(0)),
             bytes_in: Arc::new(AtomicU64::new(0)),
             vpn_up_since_ms: Arc::new(AtomicU64::new(0)),
+            route_ok: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             pid_bytes_out: Arc::new(DashMap::new()),
             pid_bytes_in: Arc::new(DashMap::new()),
             pid_paths: Arc::new(DashMap::new()),
@@ -255,6 +260,7 @@ fn build_snapshot(
                 adapter_ip,
                 uptime_ms,
                 adapter_name: String::new(),
+                route_ok: bus.route_ok.load(Ordering::Relaxed),
             }),
             totals: Some(Totals {
                 bytes_app_to_remote: bus.bytes_out.load(Ordering::Relaxed),

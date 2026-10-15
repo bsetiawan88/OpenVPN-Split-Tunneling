@@ -1,17 +1,21 @@
 using System;
 using System.Collections.ObjectModel;
-using System.IO;
 using System.Linq;
 using System.Windows;
-using Microsoft.Win32;
 using Wpf.Ui.Controls;
 
 namespace VpnClient.Ui;
 
+/// <summary>
+/// Profiles come straight from the OpenVPN Community config dir
+/// (C:\Program Files\OpenVPN\config). No import step: drop .ovpn files in
+/// that folder (or a subfolder) and hit Refresh. This window only edits
+/// per-profile credentials + server override, stored in our JSON.
+/// </summary>
 public partial class VpnConfigWindow : FluentWindow
 {
-    private readonly Config _cfg;
-    public ObservableCollection<OvpnEntry> Profiles { get; }
+    private Config _cfg;
+    public ObservableCollection<OvpnEntry> Profiles { get; private set; } = new();
     public event EventHandler? ConfigChanged;
 
     private OvpnEntry? _editing;
@@ -20,50 +24,55 @@ public partial class VpnConfigWindow : FluentWindow
     {
         InitializeComponent();
         _cfg = cfg;
-        Profiles = new ObservableCollection<OvpnEntry>(cfg.OvpnFiles);
+        RefreshFromDisk();
+    }
+
+    private void RefreshFromDisk()
+    {
+        _cfg.RefreshFromDisk();
+        Profiles = new ObservableCollection<OvpnEntry>(_cfg.OvpnFiles);
         ProfileList.ItemsSource = Profiles;
         if (Profiles.Count > 0)
             ProfileList.SelectedIndex = 0;
+        else
+        {
+            _editing = null;
+            DetailGrid.Visibility = Visibility.Collapsed;
+            EmptyText.Visibility = Visibility.Visible;
+            EmptyText.Text = $"No .ovpn files found in:\n{OpenVpnConfigSource.DescribeDirs()}\n\n" +
+                             "Copy your provider's .ovpn files there (plus ca/cert/key files they reference), then hit Refresh.";
+        }
+        DirHintText.Text = OpenVpnConfigSource.DescribeDirs();
+        ConfigChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    private void ImportBtn_Click(object sender, RoutedEventArgs e)
-    {
-        var dlg = new OpenFileDialog
-        {
-            Filter = "OpenVPN configs (*.ovpn)|*.ovpn|All files (*.*)|*.*",
-            Title = "Import OpenVPN configuration",
-        };
-        if (dlg.ShowDialog(this) != true) return;
+    private void RefreshBtn_Click(object sender, RoutedEventArgs e) => RefreshFromDisk();
 
+    private void OpenFolderBtn_Click(object sender, RoutedEventArgs e)
+    {
         try
         {
-            Directory.CreateDirectory(Config.OvpnDir);
-            var fname = Path.GetFileName(dlg.FileName);
-            var dest = Path.Combine(Config.OvpnDir, fname);
-            var counter = 1;
-            while (File.Exists(dest))
+            foreach (var dir in OpenVpnConfigSource.ConfigDirs)
             {
-                var nameOnly = Path.GetFileNameWithoutExtension(fname);
-                var ext = Path.GetExtension(fname);
-                dest = Path.Combine(Config.OvpnDir, $"{nameOnly}-{counter}{ext}");
-                counter++;
+                if (System.IO.Directory.Exists(dir))
+                {
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = dir,
+                        UseShellExecute = true,
+                    });
+                    return;
+                }
             }
-            File.Copy(dlg.FileName, dest);
-
-            var remote = OvpnParser.ParseRemote(dest) ?? "";
-            var entry = new OvpnEntry
-            {
-                DisplayName = Path.GetFileNameWithoutExtension(dest),
-                FilePath = dest,
-                ServerHostname = remote,
-            };
-            Profiles.Add(entry);
-            ProfileList.SelectedItem = entry;
-            Persist();
+            System.Windows.MessageBox.Show(
+                $"OpenVPN config folder not found:\n{OpenVpnConfigSource.DescribeDirs()}",
+                "Folder not found",
+                System.Windows.MessageBoxButton.OK,
+                System.Windows.MessageBoxImage.Warning);
         }
         catch (Exception ex)
         {
-            System.Windows.MessageBox.Show($"Import failed:\n{ex.Message}", "Import error",
+            System.Windows.MessageBox.Show($"Cannot open folder:\n{ex.Message}", "Error",
                 System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Error);
         }
     }
@@ -80,6 +89,9 @@ public partial class VpnConfigWindow : FluentWindow
             ServerOverrideBox.Text = entry.ServerOverride;
             UsernameBox.Text = entry.Username;
             PasswordBox.Password = entry.GetPassword();
+            FilePathText.Text = entry.FilePath;
+            NeedsAuthHint.Visibility = OvpnParser.RequiresAuth(entry.FilePath)
+                ? Visibility.Visible : Visibility.Collapsed;
         }
         else
         {
@@ -95,7 +107,7 @@ public partial class VpnConfigWindow : FluentWindow
         var current = _editing;
         current.DisplayName = DisplayNameBox.Text.Trim();
         if (string.IsNullOrEmpty(current.DisplayName))
-            current.DisplayName = Path.GetFileNameWithoutExtension(current.FilePath);
+            current.DisplayName = System.IO.Path.GetFileNameWithoutExtension(current.FilePath);
         current.ServerOverride = ServerOverrideBox.Text.Trim();
         current.Username = UsernameBox.Text.Trim();
         current.SetPassword(PasswordBox.Password);
@@ -105,34 +117,36 @@ public partial class VpnConfigWindow : FluentWindow
         ProfileList.Items.Refresh();
     }
 
-    private void DeleteBtn_Click(object sender, RoutedEventArgs e)
+    private void ClearCredsBtn_Click(object sender, RoutedEventArgs e)
     {
         if (_editing is null) return;
         var result = System.Windows.MessageBox.Show(
-            $"Delete profile \"{_editing.DisplayName}\"?\nThis also removes the imported .ovpn file.",
-            "Confirm delete",
+            $"Clear saved username/password for \"{_editing.DisplayName}\"?\n" +
+            "The .ovpn file itself stays in the OpenVPN config folder.",
+            "Clear credentials",
             System.Windows.MessageBoxButton.YesNo,
-            System.Windows.MessageBoxImage.Warning);
+            System.Windows.MessageBoxImage.Question);
         if (result != System.Windows.MessageBoxResult.Yes) return;
 
-        try { File.Delete(_editing.FilePath); } catch { }
-        Profiles.Remove(_editing);
-        _editing = null;
-        DetailGrid.Visibility = Visibility.Collapsed;
-        EmptyText.Visibility = Visibility.Visible;
+        _editing.Username = "";
+        _editing.SetPassword("");
+        _editing.ServerOverride = "";
+        UsernameBox.Text = "";
+        PasswordBox.Password = "";
+        ServerOverrideBox.Text = "";
         Persist();
     }
 
     private async void ConnectProfileBtn_Click(object sender, RoutedEventArgs e)
     {
         if (_editing is null) return;
-        if (string.IsNullOrWhiteSpace(_editing.Username)
-            || string.IsNullOrWhiteSpace(_editing.GetPassword()))
+        if (OvpnParser.RequiresAuth(_editing.FilePath)
+            && (string.IsNullOrWhiteSpace(_editing.Username)
+                || string.IsNullOrWhiteSpace(_editing.GetPassword())))
         {
-            var result = System.Windows.MessageBox.Show(
-                "This profile has no username or password saved yet.\n" +
-                "OpenVPN will prompt interactively, which won't work from a hidden window.\n\n" +
-                "Save credentials in this profile first and try again.",
+            System.Windows.MessageBox.Show(
+                "This profile needs a username + password.\n" +
+                "Save credentials first — openvpn runs hidden and cannot prompt interactively.",
                 "Missing credentials",
                 System.Windows.MessageBoxButton.OK,
                 System.Windows.MessageBoxImage.Warning);
@@ -145,6 +159,7 @@ public partial class VpnConfigWindow : FluentWindow
         try
         {
             await App.Connector.ConnectAsync(_editing);
+            Close();
         }
         catch (Exception ex)
         {

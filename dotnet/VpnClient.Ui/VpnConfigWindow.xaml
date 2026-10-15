@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
         Title="VPN Configurations"
-        Height="680" Width="900"
+        Height="700" Width="900"
         WindowBackdropType="Mica"
         WindowCornerPreference="Round"
         ExtendsContentIntoTitleBar="True">
@@ -28,35 +28,58 @@
             <Grid Grid.Column="0">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                     <RowDefinition Height="*" />
                 </Grid.RowDefinitions>
                 <ui:Button Grid.Row="0"
-                           x:Name="ImportBtn"
-                           Content="Import .ovpn…"
-                           Icon="{ui:SymbolIcon DocumentArrowDown20}"
+                           x:Name="RefreshBtn"
+                           Content="Refresh"
+                           Icon="{ui:SymbolIcon ArrowClockwise20}"
                            Appearance="Primary"
                            HorizontalAlignment="Stretch"
-                           Click="ImportBtn_Click"
+                           Click="RefreshBtn_Click"
+                           Margin="0,0,0,8" />
+                <ui:Button Grid.Row="1"
+                           x:Name="OpenFolderBtn"
+                           Content="Open config folder"
+                           Icon="{ui:SymbolIcon FolderOpen20}"
+                           Appearance="Secondary"
+                           HorizontalAlignment="Stretch"
+                           Click="OpenFolderBtn_Click"
                            Margin="0,0,0,12" />
-                <Border Grid.Row="1"
+                <Border Grid.Row="2"
                         Background="{DynamicResource ControlFillColorDefaultBrush}"
                         CornerRadius="8">
-                    <ListView x:Name="ProfileList"
-                              Background="Transparent"
-                              BorderThickness="0"
-                              SelectionChanged="ProfileList_SelectionChanged">
-                        <ListView.ItemTemplate>
-                            <DataTemplate>
-                                <StackPanel Margin="8,8">
-                                    <ui:TextBlock Text="{Binding DisplayName}" FontTypography="BodyStrong" />
-                                    <ui:TextBlock Text="{Binding ServerHostname}"
-                                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
-                                                  FontTypography="Caption"
-                                                  Margin="0,2,0,0" />
-                                </StackPanel>
-                            </DataTemplate>
-                        </ListView.ItemTemplate>
-                    </ListView>
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="*" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <ListView x:Name="ProfileList"
+                                  Grid.Row="0"
+                                  Background="Transparent"
+                                  BorderThickness="0"
+                                  SelectionChanged="ProfileList_SelectionChanged">
+                            <ListView.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Margin="8,8">
+                                        <ui:TextBlock Text="{Binding DisplayName}" FontTypography="BodyStrong" />
+                                        <ui:TextBlock Text="{Binding ServerHostname}"
+                                                      Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                                      FontTypography="Caption"
+                                                      Margin="0,2,0,0" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ListView.ItemTemplate>
+                        </ListView>
+                        <ui:TextBlock Grid.Row="1"
+                                      x:Name="DirHintText"
+                                      Text=""
+                                      FontTypography="Caption"
+                                      Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                                      Margin="12,8"
+                                      TextWrapping="Wrap" />
+                    </Grid>
                 </Border>
             </Grid>
 
@@ -68,6 +91,7 @@
               <Grid>
                 <Grid x:Name="DetailGrid" Visibility="Collapsed">
                     <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
@@ -94,21 +118,34 @@
                                    Click="ConnectProfileBtn_Click" />
                     </Grid>
 
-                    <StackPanel Grid.Row="1" Margin="0,0,0,16">
+                    <StackPanel Grid.Row="1" Margin="0,0,0,8">
+                        <ui:TextBlock x:Name="FilePathText"
+                                      Text=""
+                                      FontTypography="Caption"
+                                      Foreground="{DynamicResource TextFillColorTertiaryBrush}"
+                                      TextWrapping="Wrap" />
+                        <ui:TextBlock x:Name="NeedsAuthHint"
+                                      Text="This profile requires username + password."
+                                      Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                      FontTypography="Caption"
+                                      Margin="0,4,0,0" />
+                    </StackPanel>
+
+                    <StackPanel Grid.Row="2" Margin="0,0,0,16">
                         <ui:TextBlock Text="Display name"
                                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                       Margin="0,0,0,4" />
                         <ui:TextBox x:Name="DisplayNameBox" />
                     </StackPanel>
 
-                    <StackPanel Grid.Row="2" Margin="0,0,0,16">
+                    <StackPanel Grid.Row="3" Margin="0,0,0,16">
                         <ui:TextBlock Text="Server (from .ovpn — read only)"
                                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                       Margin="0,0,0,4" />
                         <ui:TextBox x:Name="ServerHostnameBox" IsReadOnly="True" />
                     </StackPanel>
 
-                    <StackPanel Grid.Row="3" Margin="0,0,0,16">
+                    <StackPanel Grid.Row="4" Margin="0,0,0,16">
                         <ui:TextBlock Text="Server override"
                                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                       Margin="0,0,0,4" />
@@ -116,14 +153,14 @@
                                     PlaceholderText="host or host:port — leave empty to use the .ovpn value" />
                     </StackPanel>
 
-                    <StackPanel Grid.Row="4" Margin="0,0,0,16">
+                    <StackPanel Grid.Row="5" Margin="0,0,0,16">
                         <ui:TextBlock Text="Username"
                                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                       Margin="0,0,0,4" />
                         <ui:TextBox x:Name="UsernameBox" />
                     </StackPanel>
 
-                    <StackPanel Grid.Row="5" Margin="0,0,0,16">
+                    <StackPanel Grid.Row="6" Margin="0,0,0,16">
                         <ui:TextBlock Text="Password"
                                       Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                                       Margin="0,0,0,4" />
@@ -134,10 +171,10 @@
                                       Margin="0,4,0,0" />
                     </StackPanel>
 
-                    <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
-                        <ui:Button x:Name="DeleteBtn"
-                                   Content="Delete profile"
-                                   Click="DeleteBtn_Click"
+                    <StackPanel Grid.Row="7" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+                        <ui:Button x:Name="ClearCredsBtn"
+                                   Content="Clear credentials"
+                                   Click="ClearCredsBtn_Click"
                                    Margin="0,0,8,0" />
                         <ui:Button x:Name="SaveBtn"
                                    Content="Save"
@@ -148,10 +185,11 @@
                 </Grid>
 
                 <ui:TextBlock x:Name="EmptyText"
-                              Text="Import a .ovpn file to get started — pick one from the list to edit."
+                              Text="Pick a profile from the list to edit credentials."
                               Foreground="{DynamicResource TextFillColorSecondaryBrush}"
                               HorizontalAlignment="Center"
                               VerticalAlignment="Center"
+                              TextWrapping="Wrap"
                               Visibility="Visible" />
               </Grid>
             </Border>

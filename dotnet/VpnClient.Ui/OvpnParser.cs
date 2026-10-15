@@ -32,4 +32,28 @@ public static class OvpnParser
         }
         return null;
     }
+
+    /// <summary>
+    /// True when the .ovpn requests username/password auth (has an
+    /// `auth-user-pass` directive, with or without an inline file arg).
+    /// Used to decide whether --auth-user-pass must be passed to openvpn.
+    /// </summary>
+    public static bool RequiresAuth(string filePath)
+    {
+        try
+        {
+            foreach (var raw in File.ReadAllLines(filePath))
+            {
+                var line = raw.Trim();
+                if (line.StartsWith("#") || line.StartsWith(";")) continue;
+                if (line.StartsWith("auth-user-pass", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+        catch
+        {
+            // fall through
+        }
+        return false;
+    }
 }

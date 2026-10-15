@@ -5,8 +5,7 @@ use windows::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
 use windows::Win32::NetworkManagement::IpHelper::{
     GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
     GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
-};
-use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6};
+};use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6};
 
 #[derive(Debug, Clone)]
 pub struct Adapter {
@@ -18,12 +17,18 @@ pub struct Adapter {
     /// IPv4 interface index from IP_ADAPTER_ADDRESSES_LH.IfIndex. Used for
     /// IP_UNICAST_IF socket-option pinning.
     pub if_index: u32,
+    /// First IPv4 gateway reported for this adapter (if any). For wintun
+    /// this is typically the VPN peer address OpenVPN configured.
+    pub gateway_v4: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VpnTarget {
     pub ipv4: std::net::Ipv4Addr,
     pub if_index: u32,
+    /// Next-hop learned from the adapter's gateway list (if present).
+    /// Falls back to route-table probing in vpn_state when None.
+    pub gateway: Option<Ipv4Addr>,
 }
 
 impl Adapter {
@@ -60,6 +65,7 @@ pub fn find_vpn_target(adapters: &[Adapter]) -> Option<VpnTarget> {
             return Some(VpnTarget {
                 ipv4: ip,
                 if_index: a.if_index,
+                gateway: a.gateway_v4,
             });
         }
     }
@@ -122,6 +128,30 @@ fn parse(buf: &[u8]) -> Vec<Adapter> {
             uc = u.Next;
         }
 
+        // First IPv4 gateway on this adapter, if the stack reports one.
+        // Wintun typically reports the VPN peer here; TAP may report none
+        // (point-to-point), in which case vpn_state falls back to probing
+        // the route table.
+        let mut gateway_v4: Option<Ipv4Addr> = None;
+        let mut gw = a.FirstGatewayAddress;
+        while !gw.is_null() {
+            let g = unsafe { &*gw };
+            let sa = g.Address.lpSockaddr;
+            if !sa.is_null() {
+                let family = unsafe { (*sa).sa_family };
+                if family == AF_INET {
+                    let v4 = unsafe { &*(sa as *const SOCKADDR_IN) };
+                    let raw = unsafe { v4.sin_addr.S_un.S_addr };
+                    let ip = Ipv4Addr::from(raw.to_ne_bytes());
+                    if !ip.is_unspecified() && !ip.is_loopback() {
+                        gateway_v4 = Some(ip);
+                        break;
+                    }
+                }
+            }
+            gw = unsafe { (*gw).Next };
+        }
+
         out.push(Adapter {
             friendly_name,
             description,
@@ -129,6 +159,7 @@ fn parse(buf: &[u8]) -> Vec<Adapter> {
             addresses: addrs,
             is_up,
             if_index,
+            gateway_v4,
         });
         cur = a.Next;
     }

@@ -35,8 +35,52 @@ impl Resolver {
             }
         }
         let info = lookup(pid);
-        self.cache.lock().unwrap().insert(pid, info.clone());
+        let mut cache = self.cache.lock().unwrap();
+        // PIDs get reused and short-lived processes accumulate: cap the
+        // cache so a long-running redirector can't grow it without bound.
+        // A wrong (stale) entry only costs one extra lookup on next miss
+        // because resolve() is always re-checked against the live process
+        // table by callers via parent/exe matching.
+        if cache.len() > 2000 {
+            cache.clear();
+        }
+        cache.insert(pid, info.clone());
         info
+    }
+
+    /// Parent PID via Toolhelp32 snapshot. Uncached (cheap enough at
+    /// first-packet rate, and parent relationships change over time).
+    pub fn parent_of(&self, pid: u32) -> Option<u32> {
+        parent_pid(pid)
+    }
+}
+
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found: Option<u32> = None;
+        if Process32FirstW(snap, &mut entry).is_ok() {
+            loop {
+                if entry.th32ProcessID == pid {
+                    let ppid = entry.th32ParentProcessID;
+                    if ppid != 0 && ppid != pid {
+                        found = Some(ppid);
+                    }
+                    break;
+                }
+                if Process32NextW(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+        found
     }
 }
 
