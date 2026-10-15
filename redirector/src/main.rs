@@ -17,6 +17,23 @@ use std::sync::Arc;
 use anyhow::Result;
 
 fn main() -> Result<()> {
+    // A silent redirector death (panic in a hidden window) leaves zero
+    // evidence: the UI sees a dead pipe, the tunnel runs unmanaged. Leave a
+    // last word in activity.log instead.
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("<non-string panic>");
+        status_server::append_raw_line(&format!("PANIC: {}{}", payload, location));
+    }));
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

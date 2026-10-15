@@ -180,6 +180,25 @@ fn open_activity_log() -> Option<std::fs::File> {
         .ok()
 }
 
+/// Standalone line writer for contexts without a StatusBus (notably the
+/// panic hook). Opens-closes per call: crash-safe, never holds a handle.
+pub fn append_raw_line(line: &str) {
+    use std::io::Write;
+    let Some(path) = activity_log_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "[{}] {}", local_timestamp(), oneline(line));
+    }
+}
+
 struct SecurityDescriptor {
     psd: PSECURITY_DESCRIPTOR,
 }

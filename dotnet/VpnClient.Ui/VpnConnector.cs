@@ -167,10 +167,34 @@ public class VpnConnector
         Directory.CreateDirectory(runtimeDir);
 
         var logFile = Path.Combine(runtimeDir, "openvpn.log");
-        // Start every run with a fresh log: openvpn --log truncates on open,
-        // but a run that fails before openvpn starts (missing file, bad
-        // args) would otherwise leave a STALE log behind and the
-        // AUTH_FAILED tail check could false-positive on the next exit.
+        // Credential validation BEFORE log rotation: a throw here starts no
+        // openvpn, so it must not consume the previous run's evidence.
+        var hasCreds = !string.IsNullOrWhiteSpace(profile.Username)
+            && !string.IsNullOrWhiteSpace(profile.GetPassword());
+        var needsUi = OvpnParser.NeedsUiCredentials(profile.FilePath);
+        if (needsUi && !hasCreds)
+        {
+            // Let openvpn fail with a readable log line instead of feeding it
+            // an empty auth file; the UI pre-checks this too.
+            throw new InvalidOperationException(
+                $"Profile \"{profile.DisplayName}\" needs a username + password.\n" +
+                "Open the gear icon to add credentials and try again.");
+        }
+        // Preserve the previous run's log before truncating: failover and
+        // rotate delete-and-restart on every attempt, which used to destroy
+        // the exact evidence (TLS errors, AUTH_FAILED context, pushed
+        // options) needed to diagnose "won't connect". One generation only.
+        // Copy and delete are independent: a failed copy (locked, disk full)
+        // must still truncate, or the stale-log AUTH_FAILED false-positive
+        // the old code fixed comes back.
+        try
+        {
+            if (File.Exists(logFile))
+            {
+                File.Copy(logFile, Path.Combine(runtimeDir, "openvpn.prev.log"), true);
+            }
+        }
+        catch { }
         try { File.Delete(logFile); } catch { }
         // Port picked here, consumed below inside the start gate via a local
         // copy (never the field mid-flight between concurrent starters).
@@ -197,9 +221,6 @@ public class VpnConnector
         // UI. Profiles that already carry auth (existing auth file or filled
         // inline block) are left alone: forcing our flag would override the
         // working credential the .ovpn already points at.
-        var hasCreds = !string.IsNullOrWhiteSpace(profile.Username)
-            && !string.IsNullOrWhiteSpace(profile.GetPassword());
-        var needsUi = OvpnParser.NeedsUiCredentials(profile.FilePath);
         if (needsUi && hasCreds)
         {
             // Per-profile filename: concurrent starts for different profiles
@@ -210,14 +231,7 @@ public class VpnConnector
                 $"{profile.Username}\n{profile.GetPassword()}\n").ConfigureAwait(false);
             args.Append($"--auth-user-pass \"{authFile}\" ");
         }
-        else if (needsUi && !hasCreds)
-        {
-            // Let openvpn fail with a readable log line instead of feeding it
-            // an empty auth file; the UI pre-checks this too.
-            throw new InvalidOperationException(
-                $"Profile \"{profile.DisplayName}\" needs a username + password.\n" +
-                "Open the gear icon to add credentials and try again.");
-        }
+        // (needsUi && !hasCreds already threw above, before log rotation.)
 
         // NOTE: no --windows-driver flag on purpose. OpenVPN 2.7 picks DCO
         // by default (proven by working setups); forcing wintun had no
@@ -817,7 +831,7 @@ public class VpnConnector
     /// </summary>
     public static void ClearLogsOnAppStart()
     {
-        foreach (var path in new[] { ActivityLogPath, LogPath })
+        foreach (var path in new[] { ActivityLogPath, LogPath, Path.Combine(RuntimeDir, "openvpn.prev.log") })
         {
             try
             {
