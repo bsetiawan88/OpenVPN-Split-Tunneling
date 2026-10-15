@@ -15,13 +15,13 @@ namespace VpnClient.Ui;
 /// Launches openvpn.exe with the active profile and exposes stop via
 /// OpenVPN's --management TCP interface, with Process.Kill as fallback.
 ///
-/// Reconnect policy (mandatory): while <see cref="WantConnected"/> is true
+/// Reconnect policy (mandatory failover): while <see cref="WantConnected"/> is true
 /// the connector treats ANY unexpected openvpn exit — or an explicit
-/// <see cref="NotifyVpnDownAsync"/> from the UI watchdog — as a failure to
-/// repair, not a state to display. It restarts openvpn with exponential
-/// backoff (5s → 60s cap) and keeps the same profile, forever, until the
-/// user hits Disconnect. AUTH_FAILED in the log stops the loop: retrying a
-/// bad password in a tight loop gets accounts locked.
+/// <see cref="NotifyVpnDownAsync"/> from the UI watchdog — as a signal to
+/// switch to a different profile, not a state to display. It fails over with
+/// a short delay and keeps hunting across profiles until the user hits
+/// Disconnect. AUTH_FAILED in the log stops the loop: retrying a bad
+/// password in a tight loop gets accounts locked.
 /// </summary>
 public class VpnConnector
 {
@@ -62,15 +62,6 @@ public class VpnConnector
         @"C:\Program Files (x86)\OpenVPN\bin\openvpn.exe",
     };
 
-    private static readonly TimeSpan[] ReconnectBackoff =
-    {
-        TimeSpan.FromSeconds(5),
-        TimeSpan.FromSeconds(10),
-        TimeSpan.FromSeconds(20),
-        TimeSpan.FromSeconds(30),
-        TimeSpan.FromSeconds(60),
-    };
-
     public static bool OpenVpnInstalled() => FindOpenVpn() is not null;
 
     public static string? FindOpenVpn()
@@ -88,7 +79,7 @@ public class VpnConnector
         // first, otherwise the orphan keeps its routes/ports untracked.
         await DisconnectAsync().ConfigureAwait(false);
         _wantConnected = true;
-        ReconnectAttempt = 0;
+        lock (_lock) { ReconnectAttempt = 0; }
         LastError = "";
         await StartOpenVpnAsync(profile).ConfigureAwait(false);
     }
@@ -135,15 +126,17 @@ public class VpnConnector
             }
             // Same AUTH_FAILED guard as the Exited path: a wedged-but-alive
             // openvpn with bad credentials must stop, not loop forever.
+            // (Set the message AFTER teardown: DisconnectAsync clears it.)
             if (LogIndicatesAuthFailure())
             {
+                await DisconnectAsync().ConfigureAwait(false);
                 LastError = "Authentication failed (check username/password). Auto-reconnect stopped.";
                 Status(LastError);
-                await DisconnectAsync().ConfigureAwait(false);
+                StateChanged?.Invoke(this, EventArgs.Empty);
                 return;
             }
-            Status("VPN down — reconnecting…");
-            await RestartWithBackoffAsync("vpn-adapter-down").ConfigureAwait(false);
+            Status("VPN down — switching profile…");
+            await FailoverAsync("vpn-adapter-down").ConfigureAwait(false);
         }
         finally
         {
@@ -230,12 +223,16 @@ public class VpnConnector
         // by default (proven by working setups); forcing wintun had no
         // effect (DCO was opened anyway) and only added a fallback variable.
         //
-        // --pull-filter ignore redirect-gateway tells openvpn to drop the
-        // server-pushed "default route via VPN" directive. Without it the
-        // tunnel acts as a full-system VPN even for processes we don't want
-        // to route through it. The redirector pins tunneled processes to
-        // the VPN adapter via IP_UNICAST_IF, so they egress through the
-        // tunnel without us hijacking the default route.
+        // Full tunnel (default): accept the server-pushed redirect-gateway so
+        // ALL traffic egresses via the VPN — exactly like the known-working
+        // plain script launch. Proven necessary on Proton+DCO: stripping the
+        // redirect leaves a tunnel that completes its handshake and then
+        // dies within seconds (write UDP ... code=1232), killing connectivity
+        // for listed AND unlisted apps alike.
+        //
+        // Split-tunnel (FullTunnel=false): filter the redirect so only listed
+        // apps are pinned to the tunnel via IP_UNICAST_IF. Experimental on
+        // providers whose data-path depends on the pushed redirect.
         //
         // NOTE: pushed DNS (dhcp-option) is deliberately ACCEPTED, matching
         // the known-working plain script launch. Stripping it was tried and
@@ -246,9 +243,19 @@ public class VpnConnector
         //
         // --auth-nocache avoids caching passwords in memory (also silences
         // the openvpn warning); reconnects re-read our auth file anyway.
+        bool fullTunnel = true;
+        try { fullTunnel = Config.Load().FullTunnel; } catch { }
+        // Tell the redirector which mode we run: in split mode it cleans up
+        // stale full-tunnel leftovers and installs its own route; in full
+        // mode it leaves routing to openvpn. Written before openvpn starts
+        // so it is always fresh when the adapter appears.
+        try { File.WriteAllText(Path.Combine(runtimeDir, "mode.txt"), fullTunnel ? "full" : "split"); } catch { }
         args.Append($"--management 127.0.0.1 {mgmtPort} ");
         args.Append("--auth-nocache ");
-        args.Append("--pull-filter ignore \"redirect-gateway\" ");
+        if (!fullTunnel)
+        {
+            args.Append("--pull-filter ignore \"redirect-gateway\" ");
+        }
         args.Append("--pull-filter ignore \"block-outside-dns\" ");
         args.Append($"--log \"{logFile}\" ");
         args.Append("--verb 3");
@@ -454,17 +461,17 @@ public class VpnConnector
         try
         {
             // Quick AUTH_FAILED check: retrying bad creds locks accounts.
+            // (Message set AFTER teardown: DisconnectAsync clears it.)
             if (LogIndicatesAuthFailure())
             {
+                await DisconnectAsync().ConfigureAwait(false);
                 LastError = "Authentication failed (check username/password). Auto-reconnect stopped.";
                 Status(LastError);
-                // Full teardown (not a partial flag reset) so no stale
-                // CurrentProfile/ManagementPort/_process lingers.
-                await DisconnectAsync().ConfigureAwait(false);
+                StateChanged?.Invoke(this, EventArgs.Empty);
                 return;
             }
-            Status("VPN process exited — reconnecting…");
-            await RestartWithBackoffAsync("process-exit").ConfigureAwait(false);
+            Status("VPN process exited — switching profile…");
+            await FailoverAsync("process-exit").ConfigureAwait(false);
         }
         finally
         {
@@ -472,11 +479,18 @@ public class VpnConnector
         }
     }
 
-    private async Task RestartWithBackoffAsync(string reason)
+    /// <summary>
+    /// Failover: on any failure while <see cref="WantConnected"/> is true,
+    /// switch to a DIFFERENT profile instead of retrying the dead one.
+    /// Same-profile retry is only the damped last resort when nothing else
+    /// is connectable; AUTH_FAILED still stops everything (credentials are
+    /// shared across profiles, so rotating cannot fix it).
+    /// </summary>
+    private async Task FailoverAsync(string reason)
     {
-        OvpnEntry? profile;
-        lock (_lock) { profile = CurrentProfile; }
-        if (profile is null || !WantConnected) return;
+        OvpnEntry? failed;
+        lock (_lock) { failed = CurrentProfile; }
+        if (failed is null || !WantConnected) return;
 
         var cts = new CancellationTokenSource();
         lock (_lock)
@@ -490,11 +504,49 @@ public class VpnConnector
         }
         var ct = cts.Token;
 
+        // Pick a random DIFFERENT connectable profile from a fresh scan.
+        List<OvpnEntry> others;
+        int total;
+        try
+        {
+            var fresh = Config.Load();
+            fresh.RefreshFromDisk();
+            total = fresh.OvpnFiles.Count;
+            others = fresh.OvpnFiles
+                .Where(p => p.Id != failed.Id && IsConnectableProfile(p))
+                .ToList();
+        }
+        catch { others = new List<OvpnEntry>(); total = 0; }
+
+        OvpnEntry target;
+        TimeSpan delay;
+        // Sweep-damping counter read under lock (written under lock too).
+        int seen;
+        lock (_lock) { seen = ReconnectAttempt; }
+        if (others.Count > 0)
+        {
+            target = others[Random.Shared.Next(others.Count)];
+            delay = TimeSpan.FromSeconds(3);
+            // Full sweep without success: back off hard instead of hot-looping
+            // through dead profiles.
+            if (total > 0 && seen > 0
+                && seen % Math.Max(1, total) == 0)
+            {
+                delay = TimeSpan.FromSeconds(30);
+            }
+        }
+        else
+        {
+            // Sole survivor: retry it, heavily damped.
+            target = failed;
+            delay = TimeSpan.FromSeconds(20);
+        }
+
         int attempt;
         lock (_lock) { attempt = ReconnectAttempt++; }
-        var delay = ReconnectBackoff[Math.Min(attempt, ReconnectBackoff.Length - 1)];
         LastReconnectAt = DateTime.UtcNow;
-        Status($"Reconnecting in {delay.TotalSeconds:0}s (attempt {ReconnectAttempt}, {reason})…");
+        var what = target.Id == failed.Id ? "Retrying" : "Switching";
+        Status($"{what} \"{target.DisplayName}\" in {delay.TotalSeconds:0}s (attempt {attempt + 1}, {reason})…");
         StateChanged?.Invoke(this, EventArgs.Empty);
         try
         {
@@ -522,23 +574,26 @@ public class VpnConnector
 
         // A wedged run may have written AUTH_FAILED while staying alive;
         // check again now that the process is dead, before burning another
-        // backoff round on bad credentials.
+        // round on bad credentials (shared across all profiles: stop, don't
+        // rotate). Message set after teardown (DisconnectAsync clears it).
         if (LogIndicatesAuthFailure())
         {
+            await DisconnectAsync().ConfigureAwait(false);
             LastError = "Authentication failed (check username/password). Auto-reconnect stopped.";
             Status(LastError);
-            await DisconnectAsync().ConfigureAwait(false);
+            StateChanged?.Invoke(this, EventArgs.Empty);
             return;
         }
 
-        // Re-read credentials from disk (user may have fixed them mid-outage).
+        // Re-read target credentials from disk (user may have fixed them
+        // mid-outage).
         try
         {
             var fresh = Config.Load();
             fresh.RefreshFromDisk();
-            var match = fresh.OvpnFiles.Find(p => p.Id == profile.Id)
-                ?? fresh.OvpnFiles.Find(p => string.Equals(p.FilePath, profile.FilePath, StringComparison.OrdinalIgnoreCase));
-            if (match is not null) profile = match;
+            var match = fresh.OvpnFiles.Find(p => p.Id == target.Id)
+                ?? fresh.OvpnFiles.Find(p => string.Equals(p.FilePath, target.FilePath, StringComparison.OrdinalIgnoreCase));
+            if (match is not null) target = match;
         }
         catch { }
 
@@ -549,8 +604,17 @@ public class VpnConnector
 
         try
         {
-            await StartOpenVpnAsync(profile).ConfigureAwait(false);
-            Status($"Reconnected via \"{profile.DisplayName}\" (attempt {ReconnectAttempt})");
+            await StartOpenVpnAsync(target).ConfigureAwait(false);
+            // Persist the switch so rotate, watchdog and UI follow the live
+            // profile instead of pointing at the dead one.
+            try
+            {
+                var cfg = Config.Load();
+                cfg.ActiveOvpnId = target.Id;
+                cfg.Save();
+            }
+            catch { }
+            Status($"Connected via \"{target.DisplayName}\" (attempt {attempt + 1})");
         }
         catch (InvalidOperationException ex) when (ex.Message.Contains("username"))
         {
@@ -569,7 +633,7 @@ public class VpnConnector
         catch (Exception ex)
         {
             LastError = ex.Message;
-            Status($"Reconnect failed: {ex.Message}");
+            Status($"Failover failed: {ex.Message}");
             // Keep WantConnected true — schedule another round; the
             // caller's finally resets _reconnecting so it can proceed.
             _ = Task.Run(async () =>
@@ -581,11 +645,18 @@ public class VpnConnector
         }
     }
 
+    /// <summary>Same connectability rule as the UI rotation: file must exist
+    /// and required credentials must already be saved.</summary>
+    private static bool IsConnectableProfile(OvpnEntry p) =>
+        System.IO.File.Exists(p.FilePath)
+        && (!OvpnParser.NeedsUiCredentials(p.FilePath)
+            || (!string.IsNullOrWhiteSpace(p.Username) && !string.IsNullOrWhiteSpace(p.GetPassword())));
+
     public async Task DisconnectAsync()
     {
         CancelPendingReconnect();
         _wantConnected = false;
-        ReconnectAttempt = 0;
+        lock (_lock) { ReconnectAttempt = 0; }
         lock (_lock) { _disconnectCount++; _reconnecting = false; }
 
         // Graceful via management socket first; fall through to Kill if that

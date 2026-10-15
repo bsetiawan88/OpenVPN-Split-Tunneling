@@ -20,6 +20,7 @@ public partial class MainWindow : FluentWindow
     private bool _connecting;
     private DateTime? _vpnDownSince;
     private bool _watchdogFiring;
+    private bool _initingControls;
     private string _connectorStatus = "";
     private DispatcherTimer? _rotateTimer;
     private DispatcherTimer? _ovpnLogTimer;
@@ -157,7 +158,7 @@ public partial class MainWindow : FluentWindow
                     // watchdog (covers network blips where openvpn.exe is
                     // still alive but wedged, so no Exited event fires).
                     StateText.Text = string.IsNullOrEmpty(App.Connector.LastError)
-                        ? "VPN down — reconnecting…"
+                        ? "VPN down — switching profile…"
                         : App.Connector.LastError;
                     StateDot.Fill = new SolidColorBrush(Color.FromRgb(0xC5, 0x84, 0x1A));
                     AdapterText.Text = string.IsNullOrEmpty(_connectorStatus)
@@ -272,7 +273,7 @@ public partial class MainWindow : FluentWindow
         if (vpnUp || (App.Connector.WantConnected && _connecting))
         {
             var reconnecting = App.Connector.WantConnected && !vpnUp;
-            ConnectBtn.Content = reconnecting ? "Reconnecting…" : "Disconnect";
+            ConnectBtn.Content = reconnecting ? "Switching…" : "Disconnect";
             ConnectBtn.Icon = new SymbolIcon(SymbolRegular.Stop20);
             ConnectBtn.Appearance = ControlAppearance.Secondary;
             ConnectBtn.IsEnabled = true;
@@ -463,19 +464,51 @@ public partial class MainWindow : FluentWindow
     private readonly System.Collections.Generic.List<string> _logLines = new();
     private const int MaxLogLines = 1000;
 
+    private const double NormalWidth = 900;
+    private const double WideWidth = 1400;
+
     private void InitLogPanel()
     {
-        LogCheck.IsChecked = _config.LoggingEnabled;
-        LogPanel.Visibility = _config.LoggingEnabled ? Visibility.Visible : Visibility.Collapsed;
+        // Programmatic IsChecked sets fire Changed handlers — suppress the
+        // side effects (redundant Save + footer overwrite) during init.
+        _initingControls = true;
+        try
+        {
+            LogCheck.IsChecked = _config.LoggingEnabled;
+            LogPanel.Visibility = _config.LoggingEnabled ? Visibility.Visible : Visibility.Collapsed;
+            Width = _config.LoggingEnabled ? WideWidth : NormalWidth;
+            FullTunnelCheck.IsChecked = _config.FullTunnel;
+        }
+        finally
+        {
+            _initingControls = false;
+        }
     }
 
     private void LogCheck_Changed(object sender, RoutedEventArgs e)
     {
+        if (_initingControls) return;
         _config.LoggingEnabled = LogCheck.IsChecked == true;
         _config.Save();
         LogPanel.Visibility = _config.LoggingEnabled ? Visibility.Visible : Visibility.Collapsed;
+        Width = _config.LoggingEnabled ? WideWidth : NormalWidth;
         if (_config.LoggingEnabled && _logLines.Count == 0)
             AppendLogLine("logging enabled — waiting for redirector events…");
+    }
+
+    /// <summary>
+    /// Takes effect on the next (re)connect: the flag is read fresh from
+    /// disk on every openvpn start, so a reconnect/rotate applies it without
+    /// needing a manual disconnect first.
+    /// </summary>
+    private void FullTunnelCheck_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_initingControls) return;
+        _config.FullTunnel = FullTunnelCheck.IsChecked == true;
+        _config.Save();
+        FooterText.Text = _config.FullTunnel
+            ? "Full tunnel ON — applies on next connect"
+            : "Split-tunnel ON (experimental) — applies on next connect";
     }
 
     private void ClearLogBtn_Click(object sender, RoutedEventArgs e)
@@ -522,21 +555,9 @@ public partial class MainWindow : FluentWindow
         }
     }
 
-    private void LogTabs_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
-    {
-        // Ignore bubbled SelectionChanged from nested controls (if any) —
-        // only the tab strip itself triggers a refresh.
-        if (!ReferenceEquals(e.Source, LogTabs)) return;
-        // Refresh immediately when the user opens the OpenVPN tab instead of
-        // waiting for the next 2s timer tick.
-        if (OpenVpnTab?.IsSelected == true)
-            RefreshOvpnLogNow();
-    }
-
     private void RefreshOvpnLogIfVisible()
     {
         if (LogPanel.Visibility != Visibility.Visible) return;
-        if (OpenVpnTab?.IsSelected != true) return;
         RefreshOvpnLogNow();
     }
 

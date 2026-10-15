@@ -21,6 +21,16 @@ public class Config
     /// <summary>Show the activity-log panel on the main window.</summary>
     public bool LoggingEnabled { get; set; } = false;
 
+    /// <summary>
+    /// Full tunnel: accept the server-pushed redirect-gateway so ALL traffic
+    /// egresses via the VPN (like the plain openvpn launch). When false, the
+    /// redirect is filtered and only listed apps are pinned to the tunnel
+    /// (split-tunnel — known broken on some Proton+DCO setups where the
+    /// tunnel itself dies right after handshake when redirect is stripped).
+    /// Default true: a working tunnel beats a principled-but-dead split.
+    /// </summary>
+    public bool FullTunnel { get; set; } = true;
+
     [JsonIgnore]
     public static string AppDataDir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VpnClient");

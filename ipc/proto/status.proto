@@ -81,6 +81,7 @@ enum EventKind {
   ROUTE_INSTALLED   = 9;   // split-tunnel 0.0.0.0/0 route installed
   ROUTE_MISSING     = 10;  // adapter up but route install failed
   VPN_CHANGED       = 11;  // tunnel moved to a new adapter IP/ifindex
+  SPLIT_CLEANUP     = 12;  // stale full-tunnel routes removed for split mode
 }
 
 message Command {
