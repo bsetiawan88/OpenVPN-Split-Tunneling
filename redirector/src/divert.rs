@@ -196,6 +196,11 @@ struct TcpFlow {
     /// stuck in a half-closed state squats its key forever, so every future
     /// connection reusing the ephemeral port gets RST'd ("other side closed").
     last_active: Instant,
+    /// Cumulative bytes per direction. Reported on close: a flow that dies
+    /// with r2a==0 sent a request the server never answered (blackhole),
+    /// while a2r==0 means the app never sent anything (app-side abort).
+    a2r_bytes: u64,
+    r2a_bytes: u64,
 }
 
 enum TcpState {
@@ -230,6 +235,28 @@ fn short(s: &str) -> String {
     let mut out: String = s.chars().take(MAX).collect();
     out.push('…');
     out
+}
+
+/// One-line close summary for a retired TCP flow. Abnormal closes go to the
+/// Activity panel (they explain app-visible failures); clean closes stay in
+/// the trace log. The byte split is the discriminator: r2a==0 with a2r>0
+/// means the request went out but the server never answered (blackhole or
+/// connect stall), a2r==0 means the app never sent anything (app-side abort).
+fn close_note(bus: &StatusBus, flow: &TcpFlow, key: &TcpKey, reason: &str) {
+    let summary = format!(
+        "TCP \"{}\" (pid {}) {}:{} -> {} closed ({}): app-sent={}B server-sent={}B",
+        flow.exe, flow.pid, key.src_ip, key.src_port, flow.original_dst,
+        reason, flow.a2r_bytes, flow.r2a_bytes,
+    );
+    let abnormal = (flow.r2a_bytes == 0 && flow.a2r_bytes > 0)
+        || reason == "pending-timeout, handshake never completed"
+        || reason == "halfclose-idle-timeout";
+    if abnormal {
+        tracing::warn!("{}", summary);
+        bus.emit(EventKind::BridgeFailed, short(&summary));
+    } else {
+        tracing::debug!("{}", summary);
+    }
 }
 
 /// Resolve the owning PID for a freshly-seen flow. The fast path is the
@@ -423,6 +450,8 @@ fn handle_capture(
                     original_dst: SocketAddr::V4(SocketAddrV4::new(dst_ip, dst_port)),
                     state: TcpState::Pending,
                     last_active: Instant::now(),
+                    a2r_bytes: 0,
+                    r2a_bytes: 0,
                 },
             );
         }
@@ -541,9 +570,11 @@ fn service_tcp_flows(
                 // up): free the key instead of burning the ephemeral port
                 // forever — the next SYN for it must build a fresh listener.
                 if now.duration_since(flow.last_active) > Duration::from_secs(30) {
-                    tracing::debug!(
-                        "tcp pending timeout: pid={} -> {}",
-                        flow.pid, flow.original_dst
+                    close_note(
+                        &bus,
+                        flow,
+                        key,
+                        "pending-timeout, handshake never completed",
                     );
                     flow.state = TcpState::Closed;
                 } else {
@@ -551,6 +582,7 @@ fn service_tcp_flows(
                     if matches!(socket.state(), tcp::State::Closed) {
                         // RST before the handshake completed: retire now
                         // instead of squatting the key for the 30s timeout.
+                        close_note(&bus, flow, key, "rst-before-connect");
                         flow.state = TcpState::Closed;
                     } else if socket.state() == tcp::State::Established {
                         let (a2r_tx, a2r_rx) = mpsc::channel::<Vec<u8>>(BRIDGE_CHANNEL_DEPTH);
@@ -597,14 +629,22 @@ fn service_tcp_flows(
                 // non-empty still has data for the app): FIN our side so the
                 // app sees a clean close instead of hanging, then retire.
                 if remote_to_app.is_closed() && remote_to_app.is_empty() {
+                    // Remote leg gone (outbound connect failed, or remote EOF
+                    // with the write leg drained): summary first, then FIN
+                    // our side so the app sees a clean close.
+                    close_note(&bus, flow, key, "remote-done");
                     socket.close();
                     flow.state = TcpState::Closed;
                 } else {
                     let mut moved_bytes = 0u64;
                     if let Some(tx) = app_to_remote {
-                        moved_bytes += pump_tcp_app_to_remote(socket, tx, flow.pid, stats);
+                        let n = pump_tcp_app_to_remote(socket, tx, flow.pid, stats);
+                        moved_bytes += n;
+                        flow.a2r_bytes += n;
                     }
-                    moved_bytes += pump_tcp_remote_to_app(socket, remote_to_app, flow.pid, stats);
+                    let n = pump_tcp_remote_to_app(socket, remote_to_app, flow.pid, stats);
+                    moved_bytes += n;
+                    flow.r2a_bytes += n;
                     if moved_bytes > 0 {
                         flow.last_active = now;
                     }
@@ -625,6 +665,7 @@ fn service_tcp_flows(
                         *app_to_remote = None;
                     }
                     if matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait) {
+                        close_note(&bus, flow, key, "closed");
                         flow.state = TcpState::Closed;
                     } else if *app_half_closed
                         && now.duration_since(flow.last_active) > Duration::from_secs(120)
@@ -633,10 +674,7 @@ fn service_tcp_flows(
                         // squatting the key. Fully-open idle flows are
                         // deliberately spared — those can be legit persistent
                         // streams (API SSE/WebSocket) quiet between messages.
-                        tracing::info!(
-                            "tcp half-close idle timeout: pid={} {}:{} -> {}",
-                            flow.pid, key.src_ip, key.src_port, flow.original_dst
-                        );
+                        close_note(&bus, flow, key, "halfclose-idle-timeout");
                         socket.close();
                         flow.state = TcpState::Closed;
                     }
