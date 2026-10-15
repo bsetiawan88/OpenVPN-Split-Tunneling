@@ -60,6 +60,7 @@ fn run_observe() -> Result<()> {
             policy_state.clone(),
             bus.clone(),
             tunneled_paths.clone(),
+            resolver.clone(),
         ));
         let observer_handle = {
             let resolver = resolver.clone();

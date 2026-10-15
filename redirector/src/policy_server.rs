@@ -110,7 +110,7 @@ fn apply(state: &PolicyState, msg: ipc::PolicyMessage) {
     match msg.body {
         Some(Body::AddPid(AddPid { pid })) => {
             tracing::info!("policy: add pid {}", pid);
-            policy::add(state, pid);
+            policy::add_unvalidated(state, pid);
         }
         Some(Body::RemovePid(RemovePid { pid })) => {
             tracing::info!("policy: remove pid {}", pid);

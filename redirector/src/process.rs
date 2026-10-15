@@ -48,10 +48,36 @@ impl Resolver {
         info
     }
 
+    /// Uncached resolve (skips the cache read, still populates it). For
+    /// admission-time identity checks, where a stale entry is exactly the
+    /// wrong answer (recycled PID still mapped to the previous owner).
+    pub fn resolve_fresh(&self, pid: u32) -> Option<ProcessInfo> {
+        if pid == 0 || pid == 4 {
+            return None;
+        }
+        let info = lookup(pid);
+        if let Ok(mut cache) = self.cache.lock() {
+            if cache.len() > 2000 {
+                cache.clear();
+            }
+            cache.insert(pid, info.clone());
+        }
+        info
+    }
+
     /// Parent PID via Toolhelp32 snapshot. Uncached (cheap enough at
     /// first-packet rate, and parent relationships change over time).
     pub fn parent_of(&self, pid: u32) -> Option<u32> {
         parent_pid(pid)
+    }
+
+    /// Drop cache entries for dead PIDs. A stale entry maps a recycled PID
+    /// to the previous owner's exe path, which mis-admits an unrelated new
+    /// process on its first packet. Called by proc_watcher's GC sweep.
+    pub fn retain_alive(&self, alive: &std::collections::HashSet<u32>) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.retain(|p, _| alive.contains(p));
+        }
     }
 }
 

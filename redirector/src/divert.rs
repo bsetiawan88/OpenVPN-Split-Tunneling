@@ -291,6 +291,37 @@ fn resolve_pid_with_retry(
     None
 }
 
+/// Policy fast path with recycled-PID guard. Per-packet calls pass
+/// is_new_flow=false (bare contains, one hash lookup). When the packet would
+/// open a NEW bridge flow, the live exe is fresh-resolved and must match the
+/// admitted identity — a PID recycled inside the GC window (or an exited
+/// process) fails, gets evicted, and falls through to path/parent
+/// re-qualification instead of inheriting tunnel membership.
+fn policy_admit(
+    policy_state: &PolicyState,
+    resolver: &Arc<Resolver>,
+    pid: u32,
+    is_new_flow: bool,
+) -> bool {
+    if !policy::contains(policy_state, pid) {
+        return false;
+    }
+    if !is_new_flow {
+        return true;
+    }
+    match resolver.resolve_fresh(pid) {
+        Some(info) if policy::exe_matches(policy_state, pid, &info.exe_path) => true,
+        _ => {
+            tracing::info!(
+                "policy: pid {} identity changed (recycled/exited?) — evicting, re-qualifying",
+                pid
+            );
+            policy::remove(policy_state, pid);
+            false
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_capture(
     packet: WinDivertPacket<'_, NetworkLayer>,
@@ -337,15 +368,26 @@ fn handle_capture(
     }
 
     // Three-step admission:
-    //   1. PID already in policy → tunnel
+    //   1. PID already in policy → tunnel (identity-validated when the
+    //      packet opens a NEW bridge flow — see policy_admit)
     //   2. PID has a known exe path matching the tunnel list → admit now
     //      (this is the path that closes the proc_watcher race — fast
     //      launchers like STOVE make their first connection before any
     //      polling tick would catch them)
     //   3. PID is a child of a tunneled PID → inherit (launcher -> game)
     //   4. otherwise → pass through to the default route
+    //
+    // Identity validation runs only for packets that would open a new flow
+    // (cheap hash pre-check): per-packet fresh-resolves would stall the
+    // loop, but new flows are rare enough for one OpenProcess each.
+    let flow_key_exists = if is_tcp {
+        tcp_flows.contains_key(&TcpKey { src_ip, src_port, dst_ip, dst_port })
+    } else {
+        udp_flows.contains_key(&UdpKey { src_ip, src_port, dst_ip, dst_port })
+    };
+    let is_new_flow = !flow_key_exists;
     let is_tunneled = match pid {
-        Some(p) if policy::contains(policy_state, p) => true,
+        Some(p) if policy_admit(policy_state, resolver, p, is_new_flow) => true,
         Some(p) => {
             if let Some(info) = resolver.resolve(p) {
                 if tunneled::matches(tunneled_paths, std::path::Path::new(&info.exe_path)) {
@@ -357,11 +399,11 @@ fn handle_capture(
                         EventKind::AppAdmitted,
                         format!("\"{}\" (pid {}) admitted — path match, connecting to {}:{}", info.exe_name, p, dst_ip, dst_port),
                     );
-                    policy::add(policy_state, p);
+                    policy::add(policy_state, p, &info.exe_path);
                     bus.pid_paths.insert(p, info.exe_path);
                     true
                 } else if let Some(ppid) = resolver.parent_of(p) {
-                    if policy::contains(policy_state, ppid) {
+                    if policy_admit(policy_state, resolver, ppid, true) {
                         tracing::info!(
                             "auto-tunnel (packet child): pid={} parent={} exe={}",
                             p, ppid, info.exe_path
@@ -373,7 +415,7 @@ fn handle_capture(
                                 info.exe_name, p, ppid, dst_ip, dst_port
                             ),
                         );
-                        policy::add(policy_state, p);
+                        policy::add(policy_state, p, &info.exe_path);
                         bus.pid_paths.insert(p, info.exe_path);
                         true
                     } else {
@@ -386,7 +428,7 @@ fn handle_capture(
                 // No exe path (yet) — still check parent inheritance so
                 // short-lived children of tunneled parents don't escape.
                 match resolver.parent_of(p) {
-                    Some(ppid) if policy::contains(policy_state, ppid) => {
+                    Some(ppid) if policy_admit(policy_state, resolver, ppid, true) => {
                         tracing::info!(
                             "auto-tunnel (packet child, no exe): pid={} parent={}",
                             p, ppid
@@ -395,7 +437,7 @@ fn handle_capture(
                             EventKind::AppAdmitted,
                             format!("pid {} admitted — child of pid {}, connecting to {}:{}", p, ppid, dst_ip, dst_port),
                         );
-                        policy::add(policy_state, p);
+                        policy::add_unvalidated(policy_state, p);
                         true
                     }
                     _ => false,
@@ -745,6 +787,15 @@ fn pump_tcp_app_to_remote(
 ) -> u64 {
     let mut moved = 0u64;
     while socket.can_recv() {
+        // Lossless backpressure: never consume from smoltcp unless the
+        // bridge channel has room. Consuming-then-dropping on try_send
+        // failure used to silently TRUNCATE uploads under load (opencode
+        // ships large request bodies) — the server sees a cut request and
+        // RSTs, surfacing as "other side closed". Leaving bytes in smoltcp
+        // instead propagates standard TCP window backpressure to the app.
+        if sender.capacity() == 0 {
+            break;
+        }
         let mut buf = vec![0u8; SMOLTCP_CHUNK];
         let n = match socket.recv_slice(&mut buf) {
             Ok(n) => n,
@@ -832,18 +883,36 @@ async fn tcp_bridge(
     mut from_app: mpsc::Receiver<Vec<u8>>,
     to_app: mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
+    // 15s connect cap: into a dead/blackholed tunnel, connect() would hang
+    // for minutes with zero visibility (no BridgeFailed, app just stalls).
+    // Failing fast retires the flow, frees the key, and tells the log why.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
     let stream = match target {
         Some(t) => {
             let socket = tokio::net::TcpSocket::new_v4()?;
             set_unicast_if_v4(&socket, t.if_index)?;
             socket.bind(SocketAddr::V4(SocketAddrV4::new(t.ipv4, 0)))?;
-            socket
-                .connect(dst)
+            tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(dst))
                 .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "tcp connect({}) via ifindex {} timed out after {}s (tunnel blackhole?)",
+                        dst,
+                        t.if_index,
+                        CONNECT_TIMEOUT.as_secs()
+                    )
+                })?
                 .with_context(|| format!("tcp connect({}) via ifindex {}", dst, t.if_index))?
         }
-        None => tokio::net::TcpStream::connect(dst)
+        None => tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(dst))
             .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "tcp connect({}) timed out after {}s",
+                    dst,
+                    CONNECT_TIMEOUT.as_secs()
+                )
+            })?
             .with_context(|| format!("tcp connect({})", dst))?,
     };
     tracing::debug!("tcp bridge connected to {} (local={:?})", dst, stream.local_addr().ok());

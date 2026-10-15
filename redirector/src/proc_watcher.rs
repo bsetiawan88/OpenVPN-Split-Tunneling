@@ -7,6 +7,7 @@ use anyhow::Result;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 use crate::policy::{self, PolicyState};
+use crate::process::Resolver;
 use crate::status_server::StatusBus;
 use crate::tunneled::{self, TunneledPaths};
 use ipc::status::EventKind;
@@ -22,6 +23,7 @@ pub async fn run(
     policy_state: PolicyState,
     bus: Arc<StatusBus>,
     tunneled_paths: TunneledPaths,
+    resolver: Arc<Resolver>,
 ) -> Result<()> {
     tracing::info!("proc watcher running (polls every {:?})", POLL_INTERVAL);
 
@@ -52,11 +54,24 @@ pub async fn run(
             }
             // Already admitted via the packet-time path (divert.rs) — record
             // without re-emitting, otherwise every poll duplicates the log.
+            // Refresh the stored identity ONLY on match: blindly overwriting
+            // would launder a recycled PID (new owner's exe stored before
+            // divert ever validates it). Mismatch → evict now.
             if policy::contains(&policy_state, pid_u32) {
                 if let Some(exe) = process.exe() {
+                    let path_str = exe.to_string_lossy().to_string();
                     bus.pid_paths
                         .entry(pid_u32)
-                        .or_insert_with(|| exe.to_string_lossy().to_string());
+                        .or_insert_with(|| path_str.clone());
+                    // Empty sysinfo exe proves nothing — skip, don't evict.
+                    if !path_str.is_empty() {
+                        if policy::exe_matches(&policy_state, pid_u32, &path_str) {
+                            policy::add(&policy_state, pid_u32, &path_str);
+                        } else {
+                            policy::remove(&policy_state, pid_u32);
+                            continue;
+                        }
+                    }
                 }
                 auto_tunneled.insert(pid_u32);
                 continue;
@@ -69,30 +84,59 @@ pub async fn run(
             // from a child with a different exe name.
             if let Some(parent) = process.parent() {
                 let parent_u32 = parent.as_u32();
-                if policy::contains(&policy_state, parent_u32) {
-                    let path_str = process
-                        .exe()
-                        .map(|e| e.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    tracing::info!(
-                        "auto-tunnel (child): pid={} parent={} exe={:?}",
-                        pid_u32, parent_u32, process.exe()
-                    );
-                    policy::add(&policy_state, pid_u32);
-                    if !path_str.is_empty() {
-                        bus.pid_paths.insert(pid_u32, path_str.clone());
+                // Validate the parent against THIS snapshot before adopting:
+                // a recycled parent PID must evict, not adopt. Unknown/absent
+                // parent exe proves nothing — neither admit nor evict; the GC
+                // sweep and divert's packet path decide those cases.
+                enum ParentVerdict { Adopt, Evict, Abstain }
+                let verdict = match sys.processes().get(&parent) {
+                    Some(pp) => match pp.exe() {
+                        Some(pe) => {
+                            let s = pe.to_string_lossy().to_string();
+                            if s.is_empty() {
+                                ParentVerdict::Abstain
+                            } else if policy::exe_matches(&policy_state, parent_u32, &s) {
+                                ParentVerdict::Adopt
+                            } else if policy::contains(&policy_state, parent_u32) {
+                                ParentVerdict::Evict
+                            } else {
+                                ParentVerdict::Abstain
+                            }
+                        }
+                        None => ParentVerdict::Abstain,
+                    },
+                    None => ParentVerdict::Abstain,
+                };
+                match verdict {
+                    ParentVerdict::Evict => {
+                        policy::remove(&policy_state, parent_u32);
                     }
-                    bus.emit(
-                        EventKind::AppAdmitted,
-                        format!(
-                            "\"{}\" (pid {}) admitted — child of pid {}",
-                            exe_name_of(&path_str, pid_u32),
-                            pid_u32,
-                            parent_u32
-                        ),
-                    );
-                    auto_tunneled.insert(pid_u32);
-                    continue;
+                    ParentVerdict::Adopt => {
+                        let path_str = process
+                            .exe()
+                            .map(|e| e.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        tracing::info!(
+                            "auto-tunnel (child): pid={} parent={} exe={:?}",
+                            pid_u32, parent_u32, process.exe()
+                        );
+                        policy::add(&policy_state, pid_u32, &path_str);
+                        if !path_str.is_empty() {
+                            bus.pid_paths.insert(pid_u32, path_str.clone());
+                        }
+                        bus.emit(
+                            EventKind::AppAdmitted,
+                            format!(
+                                "\"{}\" (pid {}) admitted — child of pid {}",
+                                exe_name_of(&path_str, pid_u32),
+                                pid_u32,
+                                parent_u32
+                            ),
+                        );
+                        auto_tunneled.insert(pid_u32);
+                        continue;
+                    }
+                    ParentVerdict::Abstain => {}
                 }
             }
             let Some(exe) = process.exe() else { continue };
@@ -101,7 +145,7 @@ pub async fn run(
             }
             let path_str = exe.to_string_lossy().to_string();
             tracing::info!("auto-tunnel (poll): pid={} matches {:?}", pid_u32, exe);
-            policy::add(&policy_state, pid_u32);
+            policy::add(&policy_state, pid_u32, &path_str);
             bus.pid_paths.insert(pid_u32, path_str.clone());
             bus.emit(
                 EventKind::AppAdmitted,
@@ -120,6 +164,11 @@ pub async fn run(
             .map(|p| p.as_u32())
             .collect();
         auto_tunneled.retain(|p| still_alive.contains(p));
+        // PID hygiene (the spawn-storm fix): dead PIDs must lose tunnel
+        // membership AND cached exe paths, otherwise Windows PID reuse
+        // tunnels unrelated processes / mis-admits on stale paths.
+        policy::retain_alive(&policy_state, &still_alive);
+        resolver.retain_alive(&still_alive);
         bus.pid_paths.retain(|p, _| still_alive.contains(p));
         bus.pid_bytes_out.retain(|p, _| still_alive.contains(p));
         bus.pid_bytes_in.retain(|p, _| still_alive.contains(p));
