@@ -369,6 +369,26 @@ fn handle_capture(
     };
 
     let proto = if is_tcp { PROTO_TCP } else { PROTO_UDP };
+
+    // DNS is never tunneled — in either mode. Rationale: with split's
+    // dhcp-option ignored, the only resolvers are LAN ones (RFC1918); a
+    // tunneled app's query forced through the bridge would exit the tunnel
+    // toward a private address and blackhole (Proton drops it), leaving
+    // tunneled apps with NO working DNS at all. Passing port 53 to the
+    // kernel routes it correctly in both modes (LAN direct in split, tunnel
+    // default in full). Stated trade-off: DNS names leak to the LAN
+    // resolver even for tunneled apps; their traffic stays in the tunnel.
+    // (DoH/DoT ride 443/853 and are tunneled normally. IPv6 DNS is out of
+    // scope here: the capture filter is IPv4-only, so v6 DNS already
+    // bypasses the bridge entirely.)
+    // Bonus: skipping PID resolution + admission here keeps the hot path
+    // short for the highest-rate flow class on the box.
+    if dst_port == 53 {
+        let _ = capture.send(&packet);
+        stats.passed.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
     let pid = resolve_pid_with_retry(flows, src_ip, src_port, proto);
     if let Some(p) = pid {
         flows::insert(

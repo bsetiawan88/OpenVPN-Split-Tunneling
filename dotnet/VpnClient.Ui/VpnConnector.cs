@@ -234,12 +234,25 @@ public class VpnConnector
         // apps are pinned to the tunnel via IP_UNICAST_IF. Experimental on
         // providers whose data-path depends on the pushed redirect.
         //
-        // NOTE: pushed DNS (dhcp-option) is deliberately ACCEPTED, matching
-        // the known-working plain script launch. Stripping it was tried and
-        // reverted: it diverged host DNS behavior from the working setup.
-        // block-outside-dns is still filtered: it would install WFP rules
-        // forcing ALL host DNS through the tunnel, breaking untunneled apps
-        // whenever the tunnel DNS is unreachable from the LAN.
+        // NOTE: pushed DNS (dhcp-option) handling differs per mode.
+        //
+        // Full tunnel: ACCEPTED, matching the known-working plain script
+        // launch. All traffic (including DNS) belongs in the tunnel there.
+        //
+        // Split-tunnel: IGNORED. Accepting it registers 10.96.0.1 as system
+        // DNS, and Windows then sends EVERY app's lookups into the tunnel:
+        // measured 2s x 2 timeouts per fresh hostname vs instant on LAN DNS,
+        // plus geo-mismatched answers (CDN edges near the VPN country, not
+        // the user). Untunneled apps felt this as "internet lambat".
+        // Tunneled apps keep working because the redirector passes port-53
+        // through to the kernel (see divert.rs) instead of bridging it into
+        // the tunnel blackhole. Trade-off, stated openly: DNS names of
+        // tunneled apps are visible to the LAN resolver; their traffic stays
+        // in the tunnel.
+        //
+        // block-outside-dns is still filtered in both modes: it would install
+        // WFP rules forcing ALL host DNS through the tunnel, breaking
+        // untunneled apps whenever the tunnel DNS is unreachable from LAN.
         //
         // --auth-nocache avoids caching passwords in memory (also silences
         // the openvpn warning); reconnects re-read our auth file anyway.
@@ -255,6 +268,7 @@ public class VpnConnector
         if (!fullTunnel)
         {
             args.Append("--pull-filter ignore \"redirect-gateway\" ");
+            args.Append("--pull-filter ignore \"dhcp-option\" ");
         }
         args.Append("--pull-filter ignore \"block-outside-dns\" ");
         args.Append($"--log \"{logFile}\" ");

@@ -185,7 +185,7 @@
                         <CheckBox Grid.Column="2"
                                   x:Name="FullTunnelCheck"
                                   Content="Full tunnel"
-                                  ToolTip="ON: all traffic via VPN (recommended, works everywhere). OFF: split-tunnel — only listed apps via VPN (experimental, breaks some providers)."
+                                   ToolTip="ON: all traffic via VPN (recommended, works everywhere). OFF: split-tunnel — only listed apps' traffic via VPN. Plain DNS for ALL apps uses your local network (fast, correct region), so site names of listed apps are visible locally; their traffic stays in the VPN."
                                   Checked="FullTunnelCheck_Changed"
                                   Unchecked="FullTunnelCheck_Changed"
                                   VerticalAlignment="Center"

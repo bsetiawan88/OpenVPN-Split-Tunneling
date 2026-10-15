@@ -508,7 +508,7 @@ public partial class MainWindow : FluentWindow
         _config.Save();
         FooterText.Text = _config.FullTunnel
             ? "Full tunnel ON — applies on next connect"
-            : "Split-tunnel ON (experimental) — applies on next connect";
+            : "Split-tunnel ON (experimental) — plain DNS via local network (site names visible locally; traffic stays in VPN), applies on next connect";
     }
 
     private void ClearLogBtn_Click(object sender, RoutedEventArgs e)
