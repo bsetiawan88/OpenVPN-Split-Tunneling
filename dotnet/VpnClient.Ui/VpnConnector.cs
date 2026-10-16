@@ -90,7 +90,7 @@ public class VpnConnector
     /// still be running in a wedged state). Kills + restarts the tunnel.
     /// Debounced: at most one restart in flight.
     /// </summary>
-    public async Task NotifyVpnDownAsync()
+    public async Task NotifyVpnDownAsync(string reason = "vpn-adapter-down")
     {
         lock (_lock)
         {
@@ -136,7 +136,7 @@ public class VpnConnector
                 return;
             }
             Status("VPN down — switching profile…");
-            await FailoverAsync("vpn-adapter-down").ConfigureAwait(false);
+            await FailoverAsync(reason).ConfigureAwait(false);
         }
         finally
         {
@@ -149,6 +149,91 @@ public class VpnConnector
     {
         lock (_lock) { ReconnectAttempt = 0; }
     }
+
+    private long _linkLastLen = -1;
+    private DateTime _linkLastCheck = DateTime.MinValue;
+    private DateTime _linkLastTrigger = DateTime.MinValue;
+
+    /// <summary>
+    /// Link-health watchdog, polled from the UI snapshot tick while the
+    /// adapter reports up. The adapter can be UP with an IP while the tunnel
+    /// itself is brain-dead (link socket getting 1232 network-unreachable,
+    /// TLS errors) — the old code showed green forever in that state because
+    /// nothing watched the data path. Counts fresh fatal markers in the
+    /// openvpn log tail; on a believable cluster, fails over to another
+    /// profile instead of sitting on a dead tunnel.
+    /// Throttled (≤1 scan/15s), cooldown-gated (≥90s between triggers),
+    /// best-effort: never throws, never fights an in-flight reconnect
+    /// (NotifyVpnDownAsync already debounces via _reconnecting).
+    /// </summary>
+    public async Task CheckLinkHealthAsync()
+    {
+        if (!WantConnected) return;
+        var now = DateTime.UtcNow;
+        lock (_lock)
+        {
+            if (now - _linkLastCheck < TimeSpan.FromSeconds(15)) return;
+            _linkLastCheck = now;
+        }
+        try
+        {
+            var logFile = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "VpnClient", "runtime", "openvpn.log");
+            if (!File.Exists(logFile)) return;
+            var len = new FileInfo(logFile).Length;
+            long prev;
+            lock (_lock) { prev = _linkLastLen; _linkLastLen = len; }
+            // First sight or rotated/truncated (new run): baseline only.
+            if (prev < 0 || len < prev) return;
+            if (len == prev) return;
+            DateTime lastTrigger;
+            lock (_lock) { lastTrigger = _linkLastTrigger; }
+            if (now - lastTrigger < TimeSpan.FromSeconds(90)) return;
+
+            const long maxScan = 64 * 1024;
+            var start = Math.Max(prev, len - maxScan);
+            string tail;
+            using (var fs = new FileStream(logFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                fs.Seek(start, SeekOrigin.Begin);
+                using var sr = new StreamReader(fs);
+                tail = await sr.ReadToEndAsync().ConfigureAwait(false);
+            }
+            int hitLines = 0;
+            // Count distinct LINES, not marker occurrences: a single openvpn
+            // line routinely contains two markers at once
+            // ("...cannot be reached... (code=1232)") and must not trigger
+            // alone as if it were two independent failures.
+            foreach (var line in tail.Split('\n'))
+            {
+                foreach (var marker in LinkFatalMarkers)
+                {
+                    if (line.Contains(marker, StringComparison.OrdinalIgnoreCase))
+                    {
+                        hitLines++;
+                        break;
+                    }
+                }
+                if (hitLines >= 2) break;
+            }
+            if (hitLines < 2) return;
+            lock (_lock) { _linkLastTrigger = now; }
+            Status("Link looks dead (openvpn errors) — switching profile…");
+            await NotifyVpnDownAsync("link-unhealthy").ConfigureAwait(false);
+        }
+        catch { }
+    }
+
+    private static readonly string[] LinkFatalMarkers =
+    {
+        "code=1232",
+        "cannot be reached",
+        "is unreachable",
+        "TLS Error",
+        "Connection reset",
+        "ping-restart",
+    };
 
     private async Task StartOpenVpnAsync(OvpnEntry profile)
     {

@@ -116,6 +116,10 @@ public partial class MainWindow : FluentWindow
                 _connecting = false;
                 _vpnDownSince = null;
                 App.Connector.NotifyVpnUp();
+                // Link-health watchdog: adapter-up does not imply the tunnel
+                // passes traffic (1232-dead link shows green otherwise).
+                // Throttled inside; fire-and-forget.
+                _ = App.Connector.CheckLinkHealthAsync();
                 StateSpinner.Visibility = Visibility.Collapsed;
                 StateDot.Visibility = Visibility.Visible;
                 if (vpn.RouteOk)

@@ -355,13 +355,20 @@ fn gateway_from_openvpn_log() -> Option<Ipv4Addr> {
 /// stripped) installs no server /32 bypass that would save them.
 /// Only rows via our VPN gateway or on our VPN interface are touched, so a
 /// parallel unrelated VPN on another interface is left alone.
+///
+/// PLUS: /32 rows via our VPN gateway. A server-bypass pointing INTO the
+/// tunnel is circular by definition (openvpn never installs those; only
+/// leaks/bugs create them) and kills the link socket the same way. Strict
+/// gw-match only here — a public server is never legitimately on-link, so
+/// the iface arm is deliberately not applied to /32s.
 async fn cleanup_stale_tunnel_routes(target: VpnTarget, bus: &StatusBus) {
     if !split_mode() {
         return;
     }
     let vpn_gw = resolve_gateway(target).await;
     let rows = list_tunnel_routes().await;
-    if rows.is_empty() {
+    let host_rows = list_circular_host_routes(vpn_gw).await;
+    if rows.is_empty() && host_rows.is_empty() {
         return;
     }
     let vpn_ip = target.ipv4.to_string();
@@ -414,6 +421,46 @@ async fn cleanup_stale_tunnel_routes(target: VpnTarget, bus: &StatusBus) {
             }
         }
     }
+    for (dest, _gw_str, gw, _iface) in host_rows {
+        // Strict gateway match only (guarded by is_some, same None==None
+        // lesson as above): a /32 via OUR gateway is circular by
+        // definition. No iface arm — a public server is never on-link.
+        let ours = vpn_gw.is_some() && gw == vpn_gw;
+        if !ours {
+            continue;
+        }
+        let gw = gw.unwrap();
+        let output = tokio::process::Command::new("route.exe")
+            .args([
+                "DELETE",
+                &dest,
+                "MASK",
+                "255.255.255.255",
+                &gw.to_string(),
+            ])
+            .output()
+            .await;
+        match output {
+            Ok(o) if o.status.success() => {
+                removed += 1;
+                tracing::warn!(
+                    "split cleanup: removed circular host route {} via {}",
+                    dest, gw
+                );
+            }
+            Ok(o) => {
+                tracing::info!(
+                    "split cleanup: route DELETE {} failed (may already be gone): {}",
+                    dest,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+            }
+            Err(e) => {
+                tracing::warn!("split cleanup: route.exe failed: {}", e);
+                break;
+            }
+        }
+    }
     if removed > 0 {
         bus.emit(
             EventKind::SplitCleanup,
@@ -427,8 +474,7 @@ async fn cleanup_stale_tunnel_routes(target: VpnTarget, bus: &StatusBus) {
 
 /// All (dest, gateway-str, gateway, interface-str) rows for the two
 /// full-tunnel def1 destinations from `route print -4`.
-async fn list_tunnel_routes() -> Vec<(String, String, Option<Ipv4Addr>, String)> {
-    let mut out = Vec::new();
+async fn list_tunnel_routes() -> Vec<(String, String, Option<Ipv4Addr>, String)> {    let mut out = Vec::new();
     let Ok(output) = tokio::process::Command::new("route.exe")
         .args(["print", "-4"])
         .output()
@@ -453,6 +499,47 @@ async fn list_tunnel_routes() -> Vec<(String, String, Option<Ipv4Addr>, String)>
             parts[0].to_string(),
             parts[2].to_string(),
             gw,
+            parts[3].to_string(),
+        ));
+    }
+    out
+}
+/// /32 host rows whose gateway is our VPN gateway: server traffic pointed
+/// INTO the tunnel (circular — the link socket dies with 1232). OpenVPN
+/// never installs these (its server bypass always points at the LAN
+/// gateway); only leaks/bugs create them. Pre-filtered by gateway here;
+/// the caller re-applies the strict is_some gw-match guard.
+async fn list_circular_host_routes(
+    vpn_gw: Option<Ipv4Addr>,
+) -> Vec<(String, String, Option<Ipv4Addr>, String)> {
+    let mut out = Vec::new();
+    let Some(want) = vpn_gw else {
+        return out;
+    };
+    let Ok(output) = tokio::process::Command::new("route.exe")
+        .args(["print", "-4"])
+        .output()
+        .await
+    else {
+        return out;
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        // Layout: Network Destination, Netmask, Gateway, Interface, Metric
+        if parts[1] != "255.255.255.255" {
+            continue;
+        }
+        if parts[2].parse::<Ipv4Addr>().ok() != Some(want) {
+            continue;
+        }
+        out.push((
+            parts[0].to_string(),
+            parts[2].to_string(),
+            Some(want),
             parts[3].to_string(),
         ));
     }
