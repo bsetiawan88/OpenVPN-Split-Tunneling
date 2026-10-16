@@ -18,9 +18,6 @@ public class Config
     /// <summary>Rotate interval in minutes. Clamped to 5..720 on load.</summary>
     public int RotateIntervalMinutes { get; set; } = 30;
 
-    /// <summary>Show the activity-log panel on the main window.</summary>
-    public bool LoggingEnabled { get; set; } = false;
-
     /// <summary>
     /// Full tunnel: accept the server-pushed redirect-gateway so ALL traffic
     /// egresses via the VPN (like the plain openvpn launch). When false, the

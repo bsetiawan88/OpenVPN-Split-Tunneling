@@ -23,7 +23,7 @@ public partial class MainWindow : FluentWindow
     private bool _initingControls;
     private string _connectorStatus = "";
     private DispatcherTimer? _rotateTimer;
-    private DispatcherTimer? _ovpnLogTimer;
+    private DispatcherTimer? _healthTimer;
 
     private static readonly int[] RotateChoices = { 5, 10, 15, 30, 60, 120, 180, 360 };
 
@@ -31,18 +31,19 @@ public partial class MainWindow : FluentWindow
     {
         InitializeComponent();
         _statusClient.SnapshotReceived += OnSnapshot;
-        _statusClient.LogReceived += OnLogEvent;
         _statusClient.ConnectionChanged += OnConnectionChanged;
         App.Connector.StatusMessage += OnConnectorStatus;
         App.Connector.StateChanged += OnConnectorStateChanged;
         Loaded += (_, _) => {
             _config.RefreshFromDisk();
             InitRotateControls();
-            InitLogPanel();
+            InitLogFooter();
             _statusClient.Start();
-            _ovpnLogTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
-            _ovpnLogTimer.Tick += (_, _) => RefreshOvpnLogIfVisible();
-            _ovpnLogTimer.Start();
+            // Link-health watchdog tick (independent of the status pipe and
+            // of any log UI — the check is throttled inside).
+            _healthTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+            _healthTimer.Tick += (_, _) => _ = App.Connector.CheckLinkHealthAsync();
+            _healthTimer.Start();
             RefreshAppList();
             UpdateConnectButtonState(false);
             UpdateRotateHint();
@@ -50,7 +51,7 @@ public partial class MainWindow : FluentWindow
         Closed += (_, _) =>
         {
             _rotateTimer?.Stop();
-            _ovpnLogTimer?.Stop();
+            _healthTimer?.Stop();
             _statusClient.Stop();
         };
     }
@@ -126,7 +127,7 @@ public partial class MainWindow : FluentWindow
                 {
                     StateText.Text = "VPN connected";
                     StateDot.Fill = new SolidColorBrush(Color.FromRgb(0x10, 0xA1, 0x6B));
-                    AdapterText.Text = $"egress source {vpn.AdapterIp}";
+                    AdapterText.Text = EgressLine(vpn.AdapterIp, "");
                 }
                 else
                 {
@@ -135,7 +136,7 @@ public partial class MainWindow : FluentWindow
                     // redirector keeps retrying the install on its poll tick.
                     StateText.Text = "VPN connected — tunnel route missing";
                     StateDot.Fill = new SolidColorBrush(Color.FromRgb(0xC5, 0x84, 0x1A));
-                    AdapterText.Text = $"egress source {vpn.AdapterIp} — repairing split-tunnel route…";
+                    AdapterText.Text = EgressLine(vpn.AdapterIp, "repairing split-tunnel route…");
                 }
                 UpdateProfileText();
                 UptimeText.Text = FormatUptime(vpn.UptimeMs);
@@ -242,6 +243,18 @@ public partial class MainWindow : FluentWindow
         var settings = new SettingsWindow(_config) { Owner = this };
         settings.ConfigChanged += (_, _) => RefreshAppList();
         settings.ShowDialog();
+    }
+
+    /// <summary>
+    /// Prominent connected line: tunnel IP plus egress server, e.g.
+    /// "VPN IP 10.96.0.21 · via 93.190.142.102". The server part comes
+    /// from the live profile (may be empty on stale snapshots).
+    /// </summary>
+    private static string EgressLine(string ip, string suffix)
+    {
+        var server = App.Connector.CurrentProfile?.EffectiveServer;
+        var via = string.IsNullOrWhiteSpace(server) ? "" : $" · via {server}";
+        return string.IsNullOrEmpty(suffix) ? $"VPN IP {ip}{via}" : $"VPN IP {ip}{via} — {suffix}";
     }
 
     /// <summary>
@@ -463,42 +476,48 @@ public partial class MainWindow : FluentWindow
         }
     }
 
-    #region Activity log
+    #region Log files (automatic — no checkbox)
 
-    private readonly System.Collections.Generic.List<string> _logLines = new();
-    private const int MaxLogLines = 1000;
+    // Logging is always on, straight to files (one set per app start):
+    //   activity.log  — redirector events (admissions, bridges, closes)
+    //   openvpn.log / openvpn.prev.log — current + previous openvpn run
+    // This region only shows WHERE they live and opens the folder.
 
-    private const double NormalWidth = 900;
-    private const double WideWidth = 1400;
-
-    private void InitLogPanel()
+    private void InitLogFooter()
     {
-        // Programmatic IsChecked sets fire Changed handlers — suppress the
-        // side effects (redundant Save + footer overwrite) during init.
+        // Programmatic IsChecked fires Changed handlers — suppress the
+        // redundant Save during init.
         _initingControls = true;
         try
         {
-            LogCheck.IsChecked = _config.LoggingEnabled;
-            LogPanel.Visibility = _config.LoggingEnabled ? Visibility.Visible : Visibility.Collapsed;
-            Width = _config.LoggingEnabled ? WideWidth : NormalWidth;
             FullTunnelCheck.IsChecked = _config.FullTunnel;
         }
         finally
         {
             _initingControls = false;
         }
+        LogPathText.Text = VpnConnector.RuntimeDir;
+        LogPathText.ToolTip = VpnConnector.RuntimeDir;
     }
 
-    private void LogCheck_Changed(object sender, RoutedEventArgs e)
+    private void OpenLogFolderBtn_Click(object sender, RoutedEventArgs e)
     {
-        if (_initingControls) return;
-        _config.LoggingEnabled = LogCheck.IsChecked == true;
-        _config.Save();
-        LogPanel.Visibility = _config.LoggingEnabled ? Visibility.Visible : Visibility.Collapsed;
-        Width = _config.LoggingEnabled ? WideWidth : NormalWidth;
-        if (_config.LoggingEnabled && _logLines.Count == 0)
-            AppendLogLine("logging enabled — waiting for redirector events…");
+        try
+        {
+            System.IO.Directory.CreateDirectory(VpnConnector.RuntimeDir);
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = VpnConnector.RuntimeDir,
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            FooterText.Text = $"Cannot open log folder: {ex.Message}";
+        }
     }
+
+    #endregion
 
     /// <summary>
     /// Takes effect on the next (re)connect: the flag is read fresh from
@@ -514,88 +533,6 @@ public partial class MainWindow : FluentWindow
             ? "Full tunnel ON — applies on next connect"
             : "Split-tunnel ON (experimental) — plain DNS via local network (site names visible locally; traffic stays in VPN), applies on next connect";
     }
-
-    private void ClearLogBtn_Click(object sender, RoutedEventArgs e)
-    {
-        _logLines.Clear();
-        LogText.Text = string.Empty;
-    }
-
-    private void CopyActivityBtn_Click(object sender, RoutedEventArgs e)
-    {
-        if (string.IsNullOrEmpty(LogText.Text))
-        {
-            FooterText.Text = "Nothing to copy — activity log is empty";
-            return;
-        }
-        try
-        {
-            System.Windows.Clipboard.SetText(LogText.Text);
-            FooterText.Text = "Activity log copied to clipboard";
-        }
-        catch (Exception ex)
-        {
-            FooterText.Text = $"Copy failed: {ex.Message}";
-        }
-    }
-
-    private void RefreshOvpnLogBtn_Click(object sender, RoutedEventArgs e) => RefreshOvpnLogNow();
-
-    private void CopyOvpnLogBtn_Click(object sender, RoutedEventArgs e)
-    {
-        if (string.IsNullOrEmpty(OpenVpnLogText.Text))
-        {
-            FooterText.Text = "Nothing to copy — OpenVPN log is empty";
-            return;
-        }
-        try
-        {
-            System.Windows.Clipboard.SetText(OpenVpnLogText.Text);
-            FooterText.Text = "OpenVPN log copied to clipboard";
-        }
-        catch (Exception ex)
-        {
-            FooterText.Text = $"Copy failed: {ex.Message}";
-        }
-    }
-
-    private void RefreshOvpnLogIfVisible()
-    {
-        // Link-health watchdog also runs here (not only on snapshot-Up):
-        // with a dead redirector there are no snapshots at all, yet the
-        // openvpn log still tells a dead link — and failover doesn't need
-        // the redirector. Throttled inside; fire-and-forget.
-        _ = App.Connector.CheckLinkHealthAsync();
-        if (LogPanel.Visibility != Visibility.Visible) return;
-        RefreshOvpnLogNow();
-    }
-
-    private void RefreshOvpnLogNow()
-    {
-        OpenVpnLogText.Text = VpnConnector.ReadLogTail(400);
-    }
-
-    private void OnLogEvent(object? sender, Vpnclient.Status.Event e)
-    {
-        // Buffer only while opted in: without the gate the list pointlessly
-        // grows to its cap even for users who never open the panel.
-        if (!_config.LoggingEnabled) return;
-        Dispatcher.BeginInvoke(() => AppendLogLine($"[{e.Kind}] {e.Detail}"));
-    }
-
-    private void AppendLogLine(string line)
-    {
-        _logLines.Add($"[{DateTime.Now:HH:mm:ss}] {line}");
-        while (_logLines.Count > MaxLogLines)
-            _logLines.RemoveAt(0);
-        // Rebuilding the whole text on every event is O(n) but n is capped
-        // and events arrive at flow-rate (per connection), not packet-rate.
-        LogText.Text = string.Join(Environment.NewLine, _logLines);
-        if (LogPanel.Visibility == Visibility.Visible)
-            LogScroller.ScrollToBottom();
-    }
-
-    #endregion
 
     #region Rotate every
 

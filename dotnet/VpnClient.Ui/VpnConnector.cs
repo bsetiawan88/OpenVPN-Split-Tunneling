@@ -929,9 +929,11 @@ public class VpnConnector
     }
 
     /// <summary>
-    /// Last N lines of the openvpn log for the in-app viewer. Shared-read so
-    /// it works while openvpn is still writing. Caps the scan at the final
-    /// 256 KB so a multi-day verb-3 log doesn't jank the UI thread.
+    /// Last N lines of the openvpn log. Shared-read so it works while
+    /// openvpn is still writing. Caps the scan at the final 256 KB so a
+    /// multi-day verb-3 log doesn't jank the caller. No in-app viewer
+    /// consumes this anymore (logs are file-only); kept as a diagnostic
+    /// helper for support bundles and future tooling.
     /// </summary>
     public static string ReadLogTail(int maxLines = 400)
     {
