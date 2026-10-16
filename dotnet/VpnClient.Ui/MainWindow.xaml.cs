@@ -21,6 +21,9 @@ public partial class MainWindow : FluentWindow
     private DateTime? _vpnDownSince;
     private bool _watchdogFiring;
     private bool _initingControls;
+    private bool _pipeConnected;
+    private DateTime? _pipeLostSince;
+    private DateTime _pipeLastRelaunch = DateTime.MinValue;
     private string _connectorStatus = "";
     private DispatcherTimer? _rotateTimer;
     private DispatcherTimer? _healthTimer;
@@ -40,9 +43,15 @@ public partial class MainWindow : FluentWindow
             InitLogFooter();
             _statusClient.Start();
             // Link-health watchdog tick (independent of the status pipe and
-            // of any log UI — the check is throttled inside).
+            // of any log UI — the check is throttled inside). Also supervises
+            // the redirector itself (see SuperviseRedirector): with the pipe
+            // dead there are no snapshots, so this tick is the only observer.
             _healthTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
-            _healthTimer.Tick += (_, _) => _ = App.Connector.CheckLinkHealthAsync();
+            _healthTimer.Tick += (_, _) =>
+            {
+                _ = App.Connector.CheckLinkHealthAsync();
+                SuperviseRedirector();
+            };
             _healthTimer.Start();
             RefreshAppList();
             UpdateConnectButtonState(false);
@@ -91,13 +100,74 @@ public partial class MainWindow : FluentWindow
     {
         Dispatcher.BeginInvoke(() =>
         {
-            if (!connected)
+            _pipeConnected = connected;
+            if (connected)
             {
+                _pipeLostSince = null;
+            }
+            else
+            {
+                _pipeLostSince ??= DateTime.UtcNow;
                 StateText.Text = "Disconnected from redirector";
                 StateDot.Fill = new SolidColorBrush(Color.FromRgb(0x6B, 0x6B, 0x6B));
                 AdapterText.Text = "redirector service not running, or pipe ACL denies access";
             }
         });
+    }
+
+    /// <summary>
+    /// Redirector supervisor (UI side). If the status pipe stays down while
+    /// we still need the tunnel, the redirector is gone (clean exit, crash,
+    /// external kill — reason unknown by design) and everything downstream
+    /// of it (bridge, split route, cleanup, snapshots) is dead with it.
+    /// Relaunch it and leave a forensic line in activity.log. Safe when a
+    /// zombie still holds the pipe: the newcomer FATAL-exits loudly instead
+    /// of splitting brain. Throttled to one attempt per 30s.
+    /// </summary>
+    private void SuperviseRedirector()
+    {
+        try
+        {
+            if (_pipeConnected) return;
+            if (_pipeLostSince is null) return;
+            if (DateTime.UtcNow - _pipeLostSince < TimeSpan.FromSeconds(10)) return;
+            if (DateTime.UtcNow - _pipeLastRelaunch < TimeSpan.FromSeconds(30)) return;
+            bool want = App.Connector.WantConnected;
+            bool ovpnAlive = OpenVpnRunning();
+            if (!want && !ovpnAlive) return;
+            _pipeLastRelaunch = DateTime.UtcNow;
+            AppendActivityLine(
+                $"UI: redirector pipe lost for {(DateTime.UtcNow - _pipeLostSince.Value).TotalSeconds:0}s " +
+                $"while tunnel needed (wantConnected={want} openvpnAlive={ovpnAlive}) — relaunching redirector");
+            // Don't KillOrphans here: that would also kill a live openvpn.
+            // If a zombie holds the pipe, the newcomer exits FATAL-loud.
+            Redirector.TryStart();
+        }
+        catch { }
+    }
+
+    private static bool OpenVpnRunning()
+    {
+        try { return System.Diagnostics.Process.GetProcessesByName("openvpn").Any(); }
+        catch { return false; }
+    }
+
+    private static void AppendActivityLine(string line)
+    {
+        // Explicit ReadWrite share: the redirector may still hold the file
+        // open (pipe down while process alive corner) — default AppendAllText
+        // share (Read) would throw there and lose the line.
+        try
+        {
+            using var fs = new System.IO.FileStream(
+                VpnConnector.ActivityLogPath,
+                System.IO.FileMode.Append,
+                System.IO.FileAccess.Write,
+                System.IO.FileShare.ReadWrite);
+            using var sw = new System.IO.StreamWriter(fs);
+            sw.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] [UI] {line}");
+        }
+        catch { }
     }
 
     private void OnSnapshot(object? sender, Snapshot snapshot)
