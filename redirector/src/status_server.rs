@@ -252,13 +252,34 @@ fn create_pipe(sd: &SecurityDescriptor, first: bool) -> Result<NamedPipeServer> 
 
 pub async fn run(bus: Arc<StatusBus>, vpn_state: VpnStateHandle) -> Result<()> {
     let sd = SecurityDescriptor::allow_authenticated_users()?;
-    let mut server = create_pipe(&sd, true)?;
+    // The FIRST pipe instance failing is fatal-and-loud (another redirector
+    // holding it is the usual cause): say so in the activity file, then
+    // exit. Every LATER failure is transient: warn, wait, recreate.
+    // (Returning Err here used to exit the whole process via main's
+    // select! — marker with zero follow-up lines, no VpnUp ever.)
+    let mut server = match create_pipe(&sd, true) {
+        Ok(s) => s,
+        Err(e) => {
+            append_raw_line(&format!(
+                "FATAL: status pipe unavailable ({:#}) — another redirector running?",
+                e
+            ));
+            return Err(e).context("status pipe first instance failed");
+        }
+    };
     tracing::info!("status pipe server listening on {}", STATUS_PIPE_NAME);
 
     loop {
-        server.connect().await.context("status pipe accept failed")?;
+        if let Err(e) = server.connect().await {
+            tracing::warn!("status pipe accept failed ({:#}) — recreating", e);
+            server = recreate_pipe(&sd).await;
+            continue;
+        }
         let connected = server;
-        server = create_pipe(&sd, false)?;
+        // Always succeeds eventually (warns + sleeps between attempts), so
+        // `server` is valid at every loop top — the borrow checker can rely
+        // on it, and so can we.
+        server = recreate_pipe(&sd).await;
 
         let bus = bus.clone();
         let vpn_state = vpn_state.clone();
@@ -267,6 +288,22 @@ pub async fn run(bus: Arc<StatusBus>, vpn_state: VpnStateHandle) -> Result<()> {
                 tracing::warn!("status client disconnected: {}", e);
             }
         });
+    }
+}
+
+/// Recreate a (non-first) pipe instance, retrying forever. Pipe creation
+/// failing persistently means the process is wedged anyway; exiting (the
+/// old `?` behavior) killed the bridge too, so waiting it out is strictly
+/// better. Never returns Err.
+async fn recreate_pipe(sd: &SecurityDescriptor) -> NamedPipeServer {
+    loop {
+        match create_pipe(sd, false) {
+            Ok(s) => return s,
+            Err(e) => {
+                tracing::warn!("status pipe recreate failed ({:#}) — retrying", e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
     }
 }
 

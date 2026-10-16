@@ -65,13 +65,31 @@ fn create_pipe(sd: &SecurityDescriptor, first: bool) -> Result<NamedPipeServer> 
 
 pub async fn run(state: PolicyState) -> Result<()> {
     let sd = SecurityDescriptor::allow_authenticated_users()?;
-    let mut server = create_pipe(&sd, true)?;
+    // Parity with status_server: a first-instance failure (usually another
+    // redirector holding the pipe) must leave a forensic line, not just
+    // stderr in a hidden window.
+    let mut server = match create_pipe(&sd, true) {
+        Ok(s) => s,
+        Err(e) => {
+            crate::status_server::append_raw_line(&format!(
+                "FATAL: policy pipe unavailable ({:#}) — another redirector running?",
+                e
+            ));
+            return Err(e).context("policy pipe first instance failed");
+        }
+    };
     tracing::info!("policy pipe server listening on {}", PIPE_NAME);
 
     loop {
-        server.connect().await.context("pipe connect failed")?;
+        if let Err(e) = server.connect().await {
+            tracing::warn!("policy pipe accept failed ({:#}) — recreating", e);
+            server = recreate_pipe(&sd).await;
+            continue;
+        }
         let connected = server;
-        server = create_pipe(&sd, false)?;
+        // Always succeeds eventually (see recreate_pipe): `server` is valid
+        // at every loop top.
+        server = recreate_pipe(&sd).await;
 
         let state = state.clone();
         tokio::spawn(async move {
@@ -79,6 +97,21 @@ pub async fn run(state: PolicyState) -> Result<()> {
                 tracing::warn!("policy client disconnected: {}", e);
             }
         });
+    }
+}
+
+/// Recreate a (non-first) pipe instance, retrying forever rather than
+/// exiting the process (the old `?` killed bridge + watcher + status too).
+/// Never returns Err.
+async fn recreate_pipe(sd: &SecurityDescriptor) -> NamedPipeServer {
+    loop {
+        match create_pipe(sd, false) {
+            Ok(s) => return s,
+            Err(e) => {
+                tracing::warn!("policy pipe recreate failed ({:#}) — retrying", e);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
     }
 }
 

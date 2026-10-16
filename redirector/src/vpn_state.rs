@@ -26,7 +26,22 @@ pub async fn watcher(state: VpnState, bus: Arc<StatusBus>) -> Result<()> {
     let mut last: Option<VpnTarget> = None;
     let mut last_gateway: Option<Ipv4Addr> = None;
     loop {
-        let adapters = tokio::task::spawn_blocking(adapter::enumerate).await??;
+        // enumerate() failing (or its thread panicking) used to exit the
+        // whole process via main's select! with zero trace. Retry instead:
+        // a fresh thread is spawned every tick, so nothing wedges.
+        let adapters = match tokio::task::spawn_blocking(adapter::enumerate).await {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => {
+                tracing::warn!("adapter enumerate failed ({:#}) — retrying", e);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("adapter enumerate task failed ({}) — retrying", e);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
         let now = adapter::find_vpn_target(&adapters);
         let same = match (last, now) {
             (Some(a), Some(b)) => {

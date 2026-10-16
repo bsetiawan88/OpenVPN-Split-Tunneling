@@ -155,11 +155,13 @@ public class VpnConnector
     private DateTime _linkLastTrigger = DateTime.MinValue;
 
     /// <summary>
-    /// Link-health watchdog, polled from the UI snapshot tick while the
-    /// adapter reports up. The adapter can be UP with an IP while the tunnel
-    /// itself is brain-dead (link socket getting 1232 network-unreachable,
-    /// TLS errors) — the old code showed green forever in that state because
-    /// nothing watched the data path. Counts fresh fatal markers in the
+    /// Link-health watchdog, polled from the UI snapshot tick AND the 2s
+    /// openvpn-log timer tick (the latter fires even with a dead
+    /// redirector, when there are no snapshots at all — and failover
+    /// doesn't need the redirector). The adapter can be UP with an IP
+    /// while the tunnel itself is brain-dead (link socket getting 1232
+    /// network-unreachable, TLS errors) — the old code showed green
+    /// forever in that state because nothing watched the data path. Counts fresh fatal markers in the
     /// openvpn log tail; on a believable cluster, fails over to another
     /// profile instead of sitting on a dead tunnel.
     /// Throttled (≤1 scan/15s), cooldown-gated (≥90s between triggers),

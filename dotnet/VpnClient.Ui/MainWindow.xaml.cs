@@ -561,6 +561,11 @@ public partial class MainWindow : FluentWindow
 
     private void RefreshOvpnLogIfVisible()
     {
+        // Link-health watchdog also runs here (not only on snapshot-Up):
+        // with a dead redirector there are no snapshots at all, yet the
+        // openvpn log still tells a dead link — and failover doesn't need
+        // the redirector. Throttled inside; fire-and-forget.
+        _ = App.Connector.CheckLinkHealthAsync();
         if (LogPanel.Visibility != Visibility.Visible) return;
         RefreshOvpnLogNow();
     }
