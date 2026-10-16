@@ -44,7 +44,16 @@ pub fn run(
     resolver: Arc<Resolver>,
     tunneled_paths: TunneledPaths,
 ) -> Result<()> {
-    let capture_filter = "outbound and ip and (tcp or udp) and !loopback";
+    // NOTE on "why can't untunneled traffic fully bypass us": WinDivert's
+    // NETWORK layer carries no PID, so the filter cannot exclude apps —
+    // every matching packet MUST visit userspace for a verdict. The tax is
+    // minimized instead: (a) this filter excludes ports that can never need
+    // tunneling (DNS + link-local name chatter) so they skip the queue trip
+    // entirely, (b) the divert loop batches + never blocks on verdicts, (c)
+    // divert.rs still early-returns port 53 as backstop.
+    let capture_filter = "outbound and ip and (tcp or udp) and !loopback \
+        and not (tcp.DstPort == 53 or udp.DstPort == 53 \
+        or udp.DstPort == 5353 or udp.DstPort == 5355)";
     let capture = WinDivert::network(capture_filter, 1040, WinDivertFlags::new())
         .context("WinDivert::network capture handle failed (need admin)")?;
     // Deepen the driver queue (default 4096 packets / 4MB; max 16384 / 32MB):
@@ -417,16 +426,19 @@ fn handle_capture(
     // dhcp-option ignored, the only resolvers are LAN ones (RFC1918); a
     // tunneled app's query forced through the bridge would exit the tunnel
     // toward a private address and blackhole (Proton drops it), leaving
-    // tunneled apps with NO working DNS at all. Passing port 53 to the
-    // kernel routes it correctly in both modes (LAN direct in split, tunnel
-    // default in full). Stated trade-off: DNS names leak to the LAN
-    // resolver even for tunneled apps; their traffic stays in the tunnel.
+    // tunneled apps with NO working DNS at all. Passing port-53 through to
+    // the kernel routes it correctly in both modes (LAN direct in split,
+    // tunnel default in full). Same for link-local name chatter (mDNS 5353,
+    // LLMNR 5355): unroutable via VPN by nature, and skipping PID/admission
+    // keeps the hot path short for constant Windows background noise.
+    // Stated trade-off: DNS names leak to the LAN resolver even for
+    // tunneled apps; their traffic stays in the tunnel.
     // (DoH/DoT ride 443/853 and are tunneled normally. IPv6 DNS is out of
     // scope here: the capture filter is IPv4-only, so v6 DNS already
     // bypasses the bridge entirely.)
     // Bonus: skipping PID resolution + admission here keeps the hot path
     // short for the highest-rate flow class on the box.
-    if dst_port == 53 {
+    if dst_port == 53 || dst_port == 5353 || dst_port == 5355 {
         let _ = capture.send(&packet);
         stats.passed.fetch_add(1, Ordering::Relaxed);
         return;
