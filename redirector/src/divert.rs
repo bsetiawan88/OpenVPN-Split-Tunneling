@@ -101,6 +101,15 @@ pub fn run(
 
     let mut buffer = vec![0u8; 65535];
     let mut last_vpn = vpn_state::current(&vpn_state);
+    // Outer slot arrays are reused so the batch assembly doesn't grow; each
+    // passthrough packet still gets its own owned Vec from into_owned(),
+    // which is exactly the cost the batched send trades against its syscall
+    // saving (see the flush site for the real ratio).
+    let mut passthrough: Vec<Vec<u8>> = Vec::with_capacity(CAPTURE_BATCH);
+    let mut send_batch: Vec<WinDivertPacket<'_, NetworkLayer>> =
+        Vec::with_capacity(CAPTURE_BATCH);
+    // Reused app→remote staging buffer (see pump_tcp_app_to_remote).
+    let mut pump_scratch: Vec<u8> = Vec::with_capacity(MTU_PAYLOAD);
 
     loop {
         let now_vpn = vpn_state::current(&vpn_state);
@@ -111,9 +120,8 @@ pub fn run(
 
         let recv_result = capture.recv_wait(&mut buffer, 50);
         if let Ok(Some(packet)) = recv_result {
-            handle_capture(
+            let decision = handle_capture(
                 packet,
-                &capture,
                 &policy_state,
                 &flows,
                 &mut tcp_flows,
@@ -127,37 +135,101 @@ pub fn run(
                 &tunneled_paths,
                 &bus,
             );
+            match decision {
+                Captured::Passthrough(data) => passthrough.push(data),
+                Captured::Consumed => {}
+            }
             // Drain the queue in batches: one poll+service cycle per packet
             // collapses under flood (service scans every flow per packet).
             // Batching amortizes each cycle over up to CAPTURE_BATCH packets
             // — this also unclogs UNTUNNELED traffic sharing the same queue.
             for _ in 1..CAPTURE_BATCH {
                 match capture.recv_wait(&mut buffer, 0) {
-                    Ok(Some(packet)) => handle_capture(
-                        packet,
-                        &capture,
-                        &policy_state,
-                        &flows,
-                        &mut tcp_flows,
-                        &mut udp_flows,
-                        &mut sockets,
-                        &mut device,
-                        &tokio_handle,
-                        now_vpn,
-                        &stats,
-                        &resolver,
-                        &tunneled_paths,
-                        &bus,
-                    ),
+                    Ok(Some(packet)) => {
+                        match handle_capture(
+                            packet,
+                            &policy_state,
+                            &flows,
+                            &mut tcp_flows,
+                            &mut udp_flows,
+                            &mut sockets,
+                            &mut device,
+                            &tokio_handle,
+                            now_vpn,
+                            &stats,
+                            &resolver,
+                            &tunneled_paths,
+                            &bus,
+                        ) {
+                            Captured::Passthrough(data) => passthrough.push(data),
+                            Captured::Consumed => {}
+                        }
+                    }
                     _ => break,
                 }
             }
         }
 
+        // One overlapped syscall for the whole batch instead of one per
+        // packet: this is the dominant cost of untunneled traffic under
+        // flood (a speedtest is ~20k pps of pure passthrough). WinDivert
+        // copies the batch internally, so the honest trade is one syscall
+        // per batch in exchange for one small alloc+memcpy per packet —
+        // roughly 2-5x cheaper, not 50x.
+        if !passthrough.is_empty() {
+            send_batch.clear();
+            let mut expected_bytes: u32 = 0;
+            for data in passthrough.drain(..) {
+                expected_bytes = expected_bytes.saturating_add(data.len() as u32);
+                let mut addr = unsafe { WinDivertAddress::<NetworkLayer>::new() };
+                addr.set_outbound(true);
+                send_batch.push(WinDivertPacket {
+                    address: addr,
+                    data: Cow::Owned(data),
+                });
+            }
+            let count = send_batch.len();
+            // send_ex returns TOTAL BYTES injected, not a packet count: a
+            // short Ok(n) means the tail of the batch never hit the wire.
+            // Without this check a partial inject loses packets silently.
+            match inject.send_ex(&send_batch) {
+                Ok(n) if n != expected_bytes => tracing::warn!(
+                    "partial passthrough inject: {}/{} bytes for {} packets — tail dropped",
+                    n, expected_bytes, count
+                ),
+                Ok(_) => {}
+                Err(e) => {
+                    // One bad packet would otherwise take the whole batch
+                    // with it. Retry individually so a single poison frame
+                    // costs one packet, not 64.
+                    tracing::warn!(
+                        "batched passthrough inject failed ({} packets): {} — retrying individually",
+                        count, e
+                    );
+                    for pkt in send_batch.iter() {
+                        if let Err(e2) = inject.send(pkt) {
+                            tracing::warn!("passthrough inject failed for one packet: {}", e2);
+                        }
+                    }
+                }
+            }
+            // Release the owned buffers now rather than holding them across
+            // poll()/service_* until the next flush.
+            send_batch.clear();
+        }
+
         let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
         drain_tx(&mut device, &inject, &stats);
 
-        service_tcp_flows(&mut tcp_flows, &mut sockets, &tokio_handle, now_vpn, &stats, &bus);
+        service_tcp_flows(
+            &mut tcp_flows,
+            &mut sockets,
+            &tokio_handle,
+            now_vpn,
+            &stats,
+            &bus,
+            &mut pump_scratch,
+        );
         service_udp_flows(&mut udp_flows, &inject, &stats);
 
         let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
@@ -215,6 +287,11 @@ fn on_vpn_change(
         stats.bridges_closed.fetch_add(dropped, Ordering::Relaxed);
     }
 }
+
+/// Packet size we can ever accept into smoltcp. The tunnel MTU is 1500, so
+/// a segment's payload is at most ~1460 bytes; sizing scratch to this keeps
+/// recv_slice single-segment while avoiding the old 16KB zero-fill.
+const MTU_PAYLOAD: usize = 1500;
 
 /// Packets handled per loop iteration (poll+service amortized across them).
 /// 64 keeps per-iteration work bounded while draining floods.
@@ -329,7 +406,8 @@ fn close_note(bus: &StatusBus, flow: &TcpFlow, key: &TcpKey, reason: &str) {
 /// guaranteed to have the row by the time we'd reasonably give up — but
 /// IPHLPAPI may serve a stale snapshot for a few hundred microseconds.
 /// Holding the packet here is fine: WinDivert has it queued and it doesn't
-/// hit the wire until we call capture.send() or push it into smoltcp.
+/// hit the wire until we release it via inject.send_ex() or push it into
+/// smoltcp.
 fn resolve_pid_with_retry(
     flows: &FlowTable,
     src_ip: Ipv4Addr,
@@ -385,10 +463,23 @@ fn policy_admit(
     }
 }
 
+/// What handle_capture decided about a captured packet.
+///
+/// Passthrough packets are NOT sent here: they are handed back as owned
+/// copies so the loop can emit them with ONE WinDivertSendEx call per batch
+/// instead of one overlapped syscall per packet. Under flood (speedtest)
+/// that per-packet syscall dominated the cost of untunneled traffic.
+enum Captured {
+    /// Release the packet back to the kernel unchanged (needs an owned copy
+    /// because the shared capture buffer is reused by the next recv).
+    Passthrough(Vec<u8>),
+    /// Consumed by the bridge — do not reinject.
+    Consumed,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_capture(
     packet: WinDivertPacket<'_, NetworkLayer>,
-    capture: &WinDivert<NetworkLayer>,
     policy_state: &PolicyState,
     flows: &FlowTable,
     tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
@@ -401,13 +492,12 @@ fn handle_capture(
     resolver: &Arc<Resolver>,
     tunneled_paths: &TunneledPaths,
     bus: &Arc<StatusBus>,
-) {
+) -> Captured {
     let parsed = match parse_ipv4_l4(&packet.data) {
         Some(p) => p,
         None => {
-            let _ = capture.send(&packet);
             stats.passed.fetch_add(1, Ordering::Relaxed);
-            return;
+            return Captured::Passthrough(packet.data.into_owned());
         }
     };
 
@@ -439,18 +529,20 @@ fn handle_capture(
     // Bonus: skipping PID resolution + admission here keeps the hot path
     // short for the highest-rate flow class on the box.
     if dst_port == 53 || dst_port == 5353 || dst_port == 5355 {
-        let _ = capture.send(&packet);
         stats.passed.fetch_add(1, Ordering::Relaxed);
-        return;
+        return Captured::Passthrough(packet.data.into_owned());
     }
 
     let pid = resolve_pid_with_retry(flows, src_ip, src_port, proto);
     if let Some(p) = pid {
-        flows::insert(
-            flows,
-            LocalEndpoint { addr: IpAddr::V4(src_ip), port: src_port, proto },
-            FlowEntry { pid: p },
-        );
+        // Only take the write lock when the cached PID actually differs.
+        // Merely testing presence would freeze a stale entry forever (the
+        // observer evicts wildcard-address UDP entries but not the
+        // concrete-IP ones inserted here), so compare the value.
+        let key = LocalEndpoint { addr: IpAddr::V4(src_ip), port: src_port, proto };
+        if flows::lookup(flows, &key).map(|e| e.pid) != Some(p) {
+            flows::insert(flows, key, FlowEntry { pid: p });
+        }
     }
 
     // Three-step admission:
@@ -534,23 +626,21 @@ fn handle_capture(
     };
 
     if !is_tunneled {
-        let _ = capture.send(&packet);
         stats.passed.fetch_add(1, Ordering::Relaxed);
-        return;
+        return Captured::Passthrough(packet.data.into_owned());
     }
     let pid = pid.unwrap();
 
     // Fail-open: if the VPN is down, send the packet out the default route
-    // instead of dropping it. This trades the "no clear-text leak when VPN
-    // disconnects mid-session" guarantee for "tunneled apps keep working
-    // when the user has the VPN off." Existing smoltcp flows for this PID
-    // were already torn down by on_vpn_change when the VPN went away, so
-    // the app will see a RST and reconnect — and that reconnect goes
-    // straight through here.
+    // instead of dropping it. This trades "no clear-text leak when VPN
+    // disconnects mid-session" for "tunneled apps keep working when the
+    // user has the VPN off." Existing smoltcp flows for this PID were
+    // already torn down by on_vpn_change when the VPN went away, so the app
+    // will see a RST and reconnect — and that reconnect goes straight
+    // through here.
     if vpn_target.is_none() {
-        let _ = capture.send(&packet);
         stats.passed.fetch_add(1, Ordering::Relaxed);
-        return;
+        return Captured::Passthrough(packet.data.into_owned());
     }
 
     if is_tcp {
@@ -562,7 +652,7 @@ fn handle_capture(
             let endpoint = IpEndpoint::new(IpAddress::Ipv4(dst_ip.into()), dst_port);
             if let Err(e) = sock.listen(endpoint) {
                 tracing::warn!("smoltcp tcp::listen({}) failed: {:?}", endpoint, e);
-                return;
+                return Captured::Consumed;
             }
             let handle = sockets.add(sock);
             let exe = resolver
@@ -592,7 +682,7 @@ fn handle_capture(
             Some(p) => p,
             None => {
                 tracing::warn!("could not extract UDP payload");
-                return;
+                return Captured::Consumed;
             }
         };
 
@@ -653,6 +743,7 @@ fn handle_capture(
         stats.captured.fetch_add(1, Ordering::Relaxed);
         // packet consumed - do NOT reinject
     }
+    Captured::Consumed
 }
 
 fn drain_tx(device: &mut VirtualDevice, inject: &WinDivert<NetworkLayer>, stats: &Stats) {
@@ -689,8 +780,10 @@ fn service_tcp_flows(
     vpn_target: Option<VpnTarget>,
     stats: &Stats,
     bus: &Arc<StatusBus>,
+    scratch: &mut Vec<u8>,
 ) {
     let mut to_remove = Vec::new();
+    let mut local_scratch = std::mem::take(scratch);
     let now = Instant::now();
     for (key, flow) in tcp_flows.iter_mut() {
         match &mut flow.state {
@@ -768,7 +861,7 @@ fn service_tcp_flows(
                 } else {
                     let mut moved_bytes = 0u64;
                     if let Some(tx) = app_to_remote {
-                        let n = pump_tcp_app_to_remote(socket, tx, flow.pid, stats);
+                        let n = pump_tcp_app_to_remote(socket, tx, flow.pid, stats, &mut local_scratch);
                         moved_bytes += n;
                         flow.a2r_bytes += n;
                     }
@@ -826,6 +919,7 @@ fn service_tcp_flows(
             TcpState::Closed => to_remove.push(*key),
         }
     }
+    *scratch = local_scratch;
     for k in to_remove {
         if let Some(flow) = tcp_flows.remove(&k) {
             sockets.remove(flow.handle);
@@ -885,6 +979,7 @@ fn pump_tcp_app_to_remote(
     sender: &mpsc::Sender<Vec<u8>>,
     pid: u32,
     stats: &Stats,
+    scratch: &mut Vec<u8>,
 ) -> u64 {
     let mut moved = 0u64;
     while socket.can_recv() {
@@ -897,16 +992,20 @@ fn pump_tcp_app_to_remote(
         if sender.capacity() == 0 {
             break;
         }
-        let mut buf = vec![0u8; SMOLTCP_CHUNK];
-        let n = match socket.recv_slice(&mut buf) {
+        // Reused MTU-sized scratch: the old per-iteration
+        // `vec![0u8; SMOLTCP_CHUNK]` allocated AND zeroed 16KB to carry a
+        // ~1.4KB segment — at 20k pps that memset alone dominated the pump.
+        if scratch.len() < MTU_PAYLOAD {
+            scratch.resize(MTU_PAYLOAD, 0);
+        }
+        let n = match socket.recv_slice(&mut scratch[..]) {
             Ok(n) => n,
             Err(_) => break,
         };
         if n == 0 {
             break;
         }
-        buf.truncate(n);
-        match sender.try_send(buf) {
+        match sender.try_send(scratch[..n].to_vec()) {
             Ok(()) => {
                 moved += n as u64;
                 stats.add_app_to_remote(n as u64);
