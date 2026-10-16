@@ -14,7 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use windivert::layer::NetworkLayer;
 use windivert::prelude::*;
-use windivert_sys::ChecksumFlags;
+use windivert_sys::{ChecksumFlags, WinDivertParam};
 
 use crate::adapter::VpnTarget;
 use crate::flows::{self, FlowEntry, FlowTable, LocalEndpoint, PROTO_TCP, PROTO_UDP};
@@ -27,8 +27,12 @@ use crate::status_server::StatusBus;
 use crate::tunneled::{self, TunneledPaths};
 use crate::vpn_state::{self, VpnState};
 
-const BRIDGE_CHANNEL_DEPTH: usize = 64;
+const BRIDGE_CHANNEL_DEPTH: usize = 128;
 const SMOLTCP_CHUNK: usize = 16 * 1024;
+/// Per-socket buffers. 64KB used to cap every flow at ~window/RTT
+/// (≈10 Mbps at 50 ms); 256KB lets smoltcp advertise window scaling
+/// (win_shift derives from rx capacity) and carry ~40+ Mbps per flow.
+const SMOLTCP_BUF: usize = 256 * 1024;
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[allow(clippy::too_many_arguments)]
@@ -43,6 +47,16 @@ pub fn run(
     let capture_filter = "outbound and ip and (tcp or udp) and !loopback";
     let capture = WinDivert::network(capture_filter, 1040, WinDivertFlags::new())
         .context("WinDivert::network capture handle failed (need admin)")?;
+    // Deepen the driver queue (default 4096 packets / 4MB; max 16384 / 32MB):
+    // under flood (speedtest = tens of thousands of pps) a shallow queue
+    // drops before our loop drains it. Best-effort: a failure here must not
+    // kill the redirector.
+    if let Err(e) = capture.set_param(WinDivertParam::QueueLength, 8192) {
+        tracing::warn!("divert: QueueLength bump failed ({}), keeping driver default", e);
+    }
+    if let Err(e) = capture.set_param(WinDivertParam::QueueSize, 16 * 1024 * 1024) {
+        tracing::warn!("divert: QueueSize bump failed ({}), keeping driver default", e);
+    }
     let inject = WinDivert::network(
         "false",
         1039,
@@ -104,6 +118,31 @@ pub fn run(
                 &tunneled_paths,
                 &bus,
             );
+            // Drain the queue in batches: one poll+service cycle per packet
+            // collapses under flood (service scans every flow per packet).
+            // Batching amortizes each cycle over up to CAPTURE_BATCH packets
+            // — this also unclogs UNTUNNELED traffic sharing the same queue.
+            for _ in 1..CAPTURE_BATCH {
+                match capture.recv_wait(&mut buffer, 0) {
+                    Ok(Some(packet)) => handle_capture(
+                        packet,
+                        &capture,
+                        &policy_state,
+                        &flows,
+                        &mut tcp_flows,
+                        &mut udp_flows,
+                        &mut sockets,
+                        &mut device,
+                        &tokio_handle,
+                        now_vpn,
+                        &stats,
+                        &resolver,
+                        &tunneled_paths,
+                        &bus,
+                    ),
+                    _ => break,
+                }
+            }
         }
 
         let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
@@ -168,6 +207,10 @@ fn on_vpn_change(
     }
 }
 
+/// Packets handled per loop iteration (poll+service amortized across them).
+/// 64 keeps per-iteration work bounded while draining floods.
+const CAPTURE_BATCH: usize = 64;
+
 /// Keyed on the FULL 4-tuple: without dst, an ephemeral port reused for a
 /// different destination collides with the old flow and gets RST'd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -212,7 +255,7 @@ struct TcpFlow {
 /// Server→app staging cap. Past this, messages wait in the (bounded)
 /// channel instead — which correctly back-pressures the server via the
 /// bridge socket's receive window.
-const R2A_PENDING_CAP: usize = 256 * 1024;
+const R2A_PENDING_CAP: usize = 512 * 1024;
 
 enum TcpState {
     Pending,
@@ -501,8 +544,8 @@ fn handle_capture(
     if is_tcp {
         let key = TcpKey { src_ip, src_port, dst_ip, dst_port };
         if !tcp_flows.contains_key(&key) {
-            let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
-            let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65536]);
+            let rx_buf = tcp::SocketBuffer::new(vec![0u8; SMOLTCP_BUF]);
+            let tx_buf = tcp::SocketBuffer::new(vec![0u8; SMOLTCP_BUF]);
             let mut sock = tcp::Socket::new(rx_buf, tx_buf);
             let endpoint = IpEndpoint::new(IpAddress::Ipv4(dst_ip.into()), dst_port);
             if let Err(e) = sock.listen(endpoint) {
