@@ -20,7 +20,6 @@ public partial class MainWindow : FluentWindow
     private bool _connecting;
     private DateTime? _vpnDownSince;
     private bool _watchdogFiring;
-    private bool _initingControls;
     private bool _pipeConnected;
     private DateTime? _pipeLostSince;
     private DateTime _pipeLastRelaunch = DateTime.MinValue;
@@ -555,17 +554,6 @@ public partial class MainWindow : FluentWindow
 
     private void InitLogFooter()
     {
-        // Programmatic IsChecked fires Changed handlers — suppress the
-        // redundant Save during init.
-        _initingControls = true;
-        try
-        {
-            FullTunnelCheck.IsChecked = _config.FullTunnel;
-        }
-        finally
-        {
-            _initingControls = false;
-        }
         LogPathText.Text = VpnConnector.RuntimeDir;
         LogPathText.ToolTip = VpnConnector.RuntimeDir;
     }
@@ -588,21 +576,6 @@ public partial class MainWindow : FluentWindow
     }
 
     #endregion
-
-    /// <summary>
-    /// Takes effect on the next (re)connect: the flag is read fresh from
-    /// disk on every openvpn start, so a reconnect/rotate applies it without
-    /// needing a manual disconnect first.
-    /// </summary>
-    private void FullTunnelCheck_Changed(object sender, RoutedEventArgs e)
-    {
-        if (_initingControls) return;
-        _config.FullTunnel = FullTunnelCheck.IsChecked == true;
-        _config.Save();
-        FooterText.Text = _config.FullTunnel
-            ? "Full tunnel ON — applies on next connect"
-            : "Split-tunnel ON (experimental) — plain DNS via local network (site names visible locally; traffic stays in VPN), applies on next connect";
-    }
 
     #region Rotate every
 
