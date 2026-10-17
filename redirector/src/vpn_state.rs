@@ -68,13 +68,12 @@ pub async fn watcher(state: VpnState, bus: Arc<StatusBus>) -> Result<()> {
                         EventKind::VpnUp,
                         format!("VPN adapter up at {} (ifindex {})", t.ipv4, t.if_index),
                     );
-                    // Split mode only: stale full-tunnel leftovers (0.0.0.0/1
-                    // + 128.0.0.0/1 from taskkill'd runs) would otherwise keep
-                    // hijacking ALL traffic — including openvpn's own link
-                    // socket — into a dead tunnel. Our split run installs no
-                    // server /32 bypass (redirect was stripped), so those
-                    // stale routes are pure poison here. Full mode skips this:
-                    // openvpn manages its own pushed routes.
+                    // Stale full-tunnel leftovers (0.0.0.0/1 + 128.0.0.0/1
+                    // from taskkill'd runs) would otherwise keep hijacking ALL
+                    // traffic — including openvpn's own link socket — into a
+                    // dead tunnel. Our split run installs no server /32 bypass
+                    // (redirect was stripped), so those stale routes are pure
+                    // poison here.
                     cleanup_stale_tunnel_routes(t, &bus).await;
                     last_gateway = ensure_split_tunnel_route(t).await;
                     bus.route_ok.store(
@@ -335,24 +334,6 @@ async fn resolve_gateway(target: VpnTarget) -> Option<Ipv4Addr> {
     None
 }
 
-/// UI-selected tunnel mode, written by the UI on every openvpn start to
-/// %LocalAppData%\VpnClient\runtime\mode.txt ("full" | "split").
-/// Missing/unreadable (old UI, never started) defaults to full: never touch
-/// another manager's routes unless split was explicitly requested.
-fn split_mode() -> bool {
-    let Ok(local) = std::env::var("LOCALAPPDATA") else {
-        return false;
-    };
-    let path = PathBuf::from(local)
-        .join("VpnClient")
-        .join("runtime")
-        .join("mode.txt");
-    matches!(
-        std::fs::read_to_string(path).map(|s| s.trim().to_lowercase()),
-        Ok(s) if s == "split"
-    )
-}
-
 /// Latest `route-gateway <ip>` from the openvpn log tail. OpenVPN logs the
 /// full PUSH_REPLY, so this reflects the live server's pushed topology even
 /// when the Windows route table (split mode: redirect stripped) shows
@@ -392,7 +373,7 @@ fn gateway_from_openvpn_log() -> Option<Ipv4Addr> {
     found
 }
 
-/// Split mode only: remove stale full-tunnel leftovers
+/// Remove stale full-tunnel leftovers
 /// (0.0.0.0/1 + 128.0.0.0/1) that crashed/killed runs leak. Those rows keep
 /// hijacking ALL IPv4 — including openvpn's own link socket (hence the
 /// post-handshake `write UDP ... code=1232` death) and every untunneled app —
@@ -410,9 +391,6 @@ fn gateway_from_openvpn_log() -> Option<Ipv4Addr> {
 /// leaks/bugs create them) and kills the link socket the same way. Strict
 /// gw-match only here — a public server is never legitimately on-link.
 async fn cleanup_stale_tunnel_routes(target: VpnTarget, bus: &StatusBus) {
-    if !split_mode() {
-        return;
-    }
     let vpn_gw = resolve_gateway(target).await;
     let rows = match forward_table::list_v4() {
         Ok(r) => r,
@@ -508,12 +486,9 @@ fn is_def1_row(dest: Ipv4Addr, prefix_len: u8) -> bool {
 /// orphan from a crashed/killed run — exactly the rows that hijack IPv4 and
 /// kill OpenVPN's own link socket (`code=1232`) the moment it brings the
 /// adapter up. Conservative by construction: candidate interfaces only, only
-/// while down, only the def1 pair — our own split route (0.0.0.0/0) and a live
-/// full-mode tunnel are never touched.
+/// while down, only the def1 pair — our own split route (0.0.0.0/0) is never
+/// touched.
 async fn sweep_orphan_def1_routes(adapters: &[adapter::Adapter], bus: &StatusBus) {
-    if !split_mode() {
-        return;
-    }
     let down_vpn: std::collections::HashSet<u32> = adapters
         .iter()
         .filter(|a| a.is_vpn_candidate() && !a.is_up)

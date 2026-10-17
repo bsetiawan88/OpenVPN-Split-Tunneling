@@ -242,8 +242,8 @@ fn default_filter() -> String {
 }
 
 /// %LocalAppData%\VpnClient\runtime\redirector.log — same runtime dir as
-/// activity.log / mode.txt / openvpn.log. The redirector is the only one of
-/// those that had no file of its own.
+/// activity.log / openvpn.log. The redirector is the only one of those that
+/// had no file of its own.
 fn redirector_log_path() -> Option<PathBuf> {
     let local = std::env::var("LOCALAPPDATA").ok()?;
     Some(

@@ -346,12 +346,6 @@ public class VpnConnector
         //
         // --auth-nocache avoids caching passwords in memory (also silences
         // the openvpn warning); reconnects re-read our auth file anyway.
-        //
-        // Tell the redirector which mode we run: split mode makes it clean up
-        // stale full-tunnel leftovers and install its own per-app route.
-        // Written before openvpn starts so it is always fresh when the adapter
-        // appears.
-        try { File.WriteAllText(Path.Combine(runtimeDir, "mode.txt"), "split"); } catch { }
         args.Append($"--management 127.0.0.1 {mgmtPort} ");
         args.Append("--auth-nocache ");
         args.Append("--pull-filter ignore \"redirect-gateway\" ");

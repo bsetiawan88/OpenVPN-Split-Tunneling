@@ -47,8 +47,8 @@ pub struct StatusBus {
     activity_log: Mutex<Option<std::fs::File>>,
 }
 
-/// %LocalAppData%\VpnClient\runtime\activity.log — next to mode.txt and
-/// openvpn.log. Shared convention with the UI (VpnConnector.ActivityLogPath).
+/// %LocalAppData%\VpnClient\runtime\activity.log — next to openvpn.log.
+/// Shared convention with the UI (VpnConnector.ActivityLogPath).
 fn activity_log_path() -> Option<PathBuf> {
     let local = std::env::var("LOCALAPPDATA").ok()?;
     Some(
