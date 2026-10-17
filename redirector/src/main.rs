@@ -2,6 +2,7 @@ mod adapter;
 mod divert;
 mod forward_table;
 mod flows;
+mod nic_stats;
 mod observer;
 mod pidlookup;
 mod policy;
@@ -119,6 +120,9 @@ fn main() -> Result<()> {
 
 fn run_observe(backend: wfp::Backend) -> Result<()> {
     tracing::info!("redirector backend={:?}", backend);
+    // Adapter byte counters are backend-agnostic observability: they tell the
+    // 5s log what the NICs moved regardless of which capture path is active.
+    nic_stats::spawn();
     match backend {
         wfp::Backend::Wfp => run_observe_wfp(),
         wfp::Backend::WindDivert => run_observe_windivert(),

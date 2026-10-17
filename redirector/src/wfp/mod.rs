@@ -25,13 +25,35 @@ use crate::tunneled::TunneledPaths;
 use crate::vpn_state::{self, VpnState};
 use crate::process::Resolver;
 
-/// Which packet path to use. Default stays `WindDivert` until the
-/// callout driver is attestation-signed (Secure Boot/HVCI requirement).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Which packet path to use. `Default` lives in an impl below: it PROBES the
+/// callout driver (installed + running + device openable) and picks WFP when
+/// present, WinDivert otherwise. The fallback is deliberate, not
+/// transitional: a machine without the attestation-signed driver must keep
+/// capturing out of the box (WinDivert needs no install), and a machine with
+/// it gets the better path (kernel PID attribution, no userspace tax).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    #[default]
     WindDivert,
     Wfp,
+}
+
+impl Default for Backend {
+    fn default() -> Self {
+        let st = device::status();
+        if st.installed && st.running && st.device_openable {
+            tracing::info!(
+                "wfp: callout driver available (installed={} running={} device_openable={}) - auto-selecting WFP backend",
+                st.installed, st.running, st.device_openable
+            );
+            Self::Wfp
+        } else {
+            tracing::info!(
+                "wfp: callout driver unavailable (installed={} running={} device_openable={}) - using WinDivert backend",
+                st.installed, st.running, st.device_openable
+            );
+            Self::WindDivert
+        }
+    }
 }
 
 impl Backend {

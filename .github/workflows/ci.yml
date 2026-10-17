@@ -1,0 +1,50 @@
+# Build + test gate. Two independent jobs so a Rust break and a UI break are
+# distinguishable at a glance.
+#
+# rust: `cargo test -p redirector --bins` compiles the windivert-sys DLL from
+#       its vendored source (feature `vendored`), which drops it in OUT_DIR by
+#       default. The test exe (target\debug\deps\redirector-*.exe) imports
+#       WinDivert.dll at load time, so the build script is pointed at a stable
+#       directory (WINDIVERT_DLL_OUTPUT) and that directory is put on PATH for
+#       the test run — no driver, no elevation needed (the filter-compile test
+#       exercises WinDivertHelperCompileFilter, a pure userland call).
+# ui:   the .NET 8 WinForms app; windows-latest resolves the Windows SDK ref
+#       packs automatically, so a plain Release build is the whole check.
+name: CI
+
+on:
+  push:
+    branches: [main, feature/wfp-full]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: redirector (unit tests)
+    runs-on: windows-latest
+    env:
+      WINDIVERT_DLL_OUTPUT: ${{ github.workspace }}\windivert-bin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Prepare WinDivert runtime dir
+        # The build script only fs::copy's into an EXISTING directory.
+        run: New-Item -ItemType Directory -Force -Path "$env:WINDIVERT_DLL_OUTPUT" | Out-Null
+      - name: Run unit tests
+        run: |
+          $env:PATH += ";$env:WINDIVERT_DLL_OUTPUT"
+          cargo test -p redirector --bins
+
+  ui:
+    name: VpnClient.Ui (build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Build UI
+        run: dotnet build dotnet/VpnClient.Ui/VpnClient.Ui.csproj -c Release --nologo

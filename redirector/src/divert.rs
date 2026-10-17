@@ -34,6 +34,17 @@ const SMOLTCP_CHUNK: usize = 16 * 1024;
 /// (win_shift derives from rx capacity) and carry ~40+ Mbps per flow.
 const SMOLTCP_BUF: usize = 256 * 1024;
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long an app-side TCP handshake may stay incomplete (SYN consumed,
+/// SYN-ACK sent, final ACK never seen) before the flow is retired. In
+/// practice this state lasts milliseconds; a multi-second soak means the app
+/// abandoned the socket while our SYN-ACK was in flight — Chrome opens
+/// racing connections and closes the losers, and a never-established socket
+/// closed by the app sends no RST, so nothing else would end this state.
+/// 5s (was 30s) frees the 4-tuple six times sooner: the app's next SYN
+/// retransmission then builds a FRESH listener → SYN-ACK → handshake
+/// completes — recovery instead of squatting. Counted in the 5s report as
+/// pending_timeout so a regression shows up without log spelunking.
+const PENDING_TCP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// WinDivert capture filter — NETWORK layer, outbound TCP/UDP. The DNS /
 /// mDNS / LLMNR ports are excluded so that name chatter never pays the
@@ -123,7 +134,8 @@ pub fn run(
     let stats_clone = stats.clone();
     std::thread::spawn(move || stats_clone.report_loop());
 
-    let mut buffer = vec![0u8; 65535];
+    let mut buffer = vec![0u8; CAPTURE_BUF];
+    let mut admit_cache = AdmitCache::new();
     let mut last_vpn = vpn_state::current(&vpn_state);
     // Outer slot arrays are reused so the batch assembly doesn't grow; each
     // passthrough packet still gets its own owned Vec from into_owned(),
@@ -143,69 +155,38 @@ pub fn run(
         }
 
         let t_recv = Instant::now();
-        let recv_result = capture.recv_wait(&mut buffer, 50);
-        if recv_result.is_err() {
-            stats.recv_err.fetch_add(1, Ordering::Relaxed);
-        }
-        if let Ok(Some(packet)) = recv_result {
-            let decision = handle_capture(
-                packet,
-                &policy_state,
-                &flows,
-                &mut tcp_flows,
-                &mut udp_flows,
-                &mut sockets,
-                &mut device,
-                &tokio_handle,
-                now_vpn,
-                &stats,
-                &resolver,
-                &tunneled_paths,
-                &bus,
-            );
-            match decision {
-                Captured::Passthrough(data) => passthrough.push(data),
-                Captured::Consumed => {}
-            }
-            // Drain the queue in batches: one poll+service cycle per packet
-            // collapses under flood (service scans every flow per packet).
-            // Batching amortizes each cycle over up to CAPTURE_BATCH packets
-            // — this also unclogs UNTUNNELED traffic sharing the same queue.
-            // Each round is ONE WinDivertRecvEx returning up to RECV_BATCH
-            // packets, where the old shape paid RecvEx + WaitForSingleObject +
-            // GetOverlappedResult for every single packet.
-            for _ in 0..MAX_DRAIN_ROUNDS {
-                match capture.recv_wait_ex(&mut buffer, RECV_BATCH as u8, 0) {
-                    Ok(packets) => {
-                        if packets.is_empty() {
-                            break;
-                        }
-                        for packet in packets {
-                            match handle_capture(
-                                packet,
-                                &policy_state,
-                                &flows,
-                                &mut tcp_flows,
-                                &mut udp_flows,
-                                &mut sockets,
-                                &mut device,
-                                &tokio_handle,
-                                now_vpn,
-                                &stats,
-                                &resolver,
-                                &tunneled_paths,
-                                &bus,
-                            ) {
-                                Captured::Passthrough(data) => passthrough.push(data),
-                                Captured::Consumed => {}
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        stats.recv_err.fetch_add(1, Ordering::Relaxed);
-                        break;
+        // ONE overlapped RecvEx per iteration for up to RECV_BATCH packets.
+        // timeout_ms=50 blocks only when the queue is empty, and an expired
+        // wait surfaces as Ok(empty) — never an error — so idle iterations
+        // stay silent (no recv_err inflation). Packets beyond the batch are
+        // left in the driver queue for the next iteration; poll+service run
+        // once per batch regardless.
+        match capture.recv_wait_ex(&mut buffer, RECV_BATCH as u8, 50) {
+            Ok(packets) => {
+                for packet in packets {
+                    match handle_capture(
+                        packet,
+                        &policy_state,
+                        &flows,
+                        &mut admit_cache,
+                        &mut tcp_flows,
+                        &mut udp_flows,
+                        &mut sockets,
+                        &mut device,
+                        &tokio_handle,
+                        now_vpn,
+                        &stats,
+                        &resolver,
+                        &tunneled_paths,
+                        &bus,
+                    ) {
+                        Captured::Passthrough(data) => passthrough.push(data),
+                        Captured::Consumed => {}
                     }
                 }
+            }
+            Err(_) => {
+                stats.recv_err.fetch_add(1, Ordering::Relaxed);
             }
         }
         let t_flush = Instant::now();
@@ -262,22 +243,32 @@ pub fn run(
         }
         let t_svc = Instant::now();
 
-        let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
-        drain_tx(&mut device, &inject, &stats);
+        // Fast path: with no bridges and no sockets there is no smoltcp work
+        // to do — poll() would walk an empty socket set, the service
+        // scanners would walk empty maps, and the virtual-device queues can
+        // only be filled by those same poll()/capture paths. Pure-passthrough
+        // traffic (a speedtest, idle untunneled apps) therefore skips the
+        // whole block; the phase timer still accounts for the (zero) cost.
+        let have_bridges =
+            !tcp_flows.is_empty() || !udp_flows.is_empty() || sockets.iter().next().is_some();
+        if have_bridges {
+            let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
+            drain_tx(&mut device, &inject, &stats);
 
-        service_tcp_flows(
-            &mut tcp_flows,
-            &mut sockets,
-            &tokio_handle,
-            now_vpn,
-            &stats,
-            &bus,
-            &mut pump_scratch,
-        );
-        service_udp_flows(&mut udp_flows, &inject, &stats);
+            service_tcp_flows(
+                &mut tcp_flows,
+                &mut sockets,
+                &tokio_handle,
+                now_vpn,
+                &stats,
+                &bus,
+                &mut pump_scratch,
+            );
+            service_udp_flows(&mut udp_flows, &inject, &stats);
 
-        let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
-        drain_tx(&mut device, &inject, &stats);
+            let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
+            drain_tx(&mut device, &inject, &stats);
+        }
 
         // Where does each iteration actually go? Logged every 5s so a
         // throughput ceiling can be attributed to a phase instead of guessed.
@@ -357,13 +348,16 @@ const MTU_PAYLOAD: usize = 1500;
 /// Packets handled per loop iteration (poll+service amortized across them).
 /// 64 keeps per-iteration work bounded while draining floods.
 const CAPTURE_BATCH: usize = 64;
-/// Packets per batched WinDivertRecvEx. Bounded by the 64 KiB capture buffer
-/// (16 x 1500 B = 24 KiB), so the driver always has room for the batch.
-const RECV_BATCH: usize = 16;
-/// Batched drain rounds per loop iteration: 1 + 4 x 16 = 65 packets max, the
-/// same per-iteration bound CAPTURE_BATCH expressed, but reachable with 5
-/// syscall round-trips instead of 65.
-const MAX_DRAIN_ROUNDS: usize = 4;
+/// Packets per batched WinDivertRecvEx — the single recv syscall shape of the
+/// loop: ONE call per iteration that waits up to 50 ms only when the queue is
+/// empty and returns Ok(empty) on timeout (no error). The old shape paid the
+/// outer wait per iteration PLUS up to 4 timeout=0 drain rounds, each with
+/// its own WaitForSingleObject/CancelIo pair.
+const RECV_BATCH: usize = 32;
+/// Capture buffer sized for RECV_BATCH full-MTU frames (32 x 8 KiB): the
+/// driver fills as many packets as fit, so undersizing silently caps the
+/// batch instead of failing.
+const CAPTURE_BUF: usize = RECV_BATCH * 8 * 1024;
 /// How long a failed PID resolution suppresses further attempts for the same
 /// local endpoint. Short enough that a flow which becomes resolvable is picked
 /// up quickly; long enough that a bulk flow which can never be resolved does
@@ -568,6 +562,122 @@ fn policy_admit(
     }
 }
 
+/// How long a per-PID admission verdict is trusted on the per-packet path.
+/// Membership flips only on a UI toggle (policy add/remove) or process
+/// lifecycle, so 2s bounds the staleness to something the user never
+/// perceives — new flows are exempt entirely (they always re-evaluate).
+const ADMIT_TTL: Duration = Duration::from_secs(2);
+const ADMIT_CACHE_MAX: usize = 4096;
+
+/// PID → admission verdict, TTL-bounded. Why it exists: for a NON-tunneled
+/// process (firefox under split), every pass-through packet re-ran
+/// resolve() + `tunneled::matches` (which lowercases the candidate path —
+/// two String allocations per packet!) + parent_of(). At speedtest rates
+/// that was the dominant remaining cost of the passthrough hot path (the
+/// divert-5s timers showed it). The verdict can only change via UI toggle
+/// or PID lifecycle; both are covered by the short TTL plus the
+/// is_new_flow re-evaluation.
+struct AdmitCache {
+    map: HashMap<u32, (bool, Instant)>,
+}
+
+impl AdmitCache {
+    fn new() -> Self {
+        Self { map: HashMap::new() }
+    }
+
+    /// Fresh verdict only; `None` forces full evaluation.
+    fn get(&self, pid: u32) -> Option<bool> {
+        self.map
+            .get(&pid)
+            .and_then(|(verdict, at)| (at.elapsed() < ADMIT_TTL).then_some(*verdict))
+    }
+
+    fn put(&mut self, pid: u32, verdict: bool) {
+        if self.map.len() >= ADMIT_CACHE_MAX {
+            let now = Instant::now();
+            self.map
+                .retain(|_, (_, at)| now.duration_since(*at) < ADMIT_TTL);
+        }
+        self.map.insert(pid, (verdict, Instant::now()));
+    }
+}
+
+/// The full admission chain for one PID (steps 1-4 above). Runs on every
+/// verdict-cache miss and for every NEW flow — where it also performs the
+/// auto-tunnel side effects (policy::add + status events). Lives behind
+/// AdmitCache so repeat packets never pay its cost.
+fn evaluate_admission(
+    policy_state: &PolicyState,
+    resolver: &Arc<Resolver>,
+    tunneled_paths: &TunneledPaths,
+    bus: &Arc<StatusBus>,
+    p: u32,
+    is_new_flow: bool,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+) -> bool {
+    if policy_admit(policy_state, resolver, p, is_new_flow) {
+        return true;
+    }
+    if let Some(info) = resolver.resolve(p) {
+        if tunneled::matches(tunneled_paths, std::path::Path::new(&info.exe_path)) {
+            tracing::info!("auto-tunnel (packet): pid={} matches {}", p, info.exe_path);
+            bus.emit(
+                EventKind::AppAdmitted,
+                format!(
+                    "\"{}\" (pid {}) admitted — path match, connecting to {}:{}",
+                    info.exe_name, p, dst_ip, dst_port
+                ),
+            );
+            policy::add(policy_state, p, &info.exe_path);
+            bus.pid_paths.insert(p, info.exe_path);
+            true
+        } else if let Some(ppid) = resolver.parent_of(p) {
+            if policy_admit(policy_state, resolver, ppid, true) {
+                tracing::info!(
+                    "auto-tunnel (packet child): pid={} parent={} exe={}",
+                    p,
+                    ppid,
+                    info.exe_path
+                );
+                bus.emit(
+                    EventKind::AppAdmitted,
+                    format!(
+                        "\"{}\" (pid {}) admitted — child of pid {}, connecting to {}:{}",
+                        info.exe_name, p, ppid, dst_ip, dst_port
+                    ),
+                );
+                policy::add(policy_state, p, &info.exe_path);
+                bus.pid_paths.insert(p, info.exe_path);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        // No exe path (yet) — still check parent inheritance so short-lived
+        // children of tunneled parents don't escape.
+        match resolver.parent_of(p) {
+            Some(ppid) if policy_admit(policy_state, resolver, ppid, true) => {
+                tracing::info!("auto-tunnel (packet child, no exe): pid={} parent={}", p, ppid);
+                bus.emit(
+                    EventKind::AppAdmitted,
+                    format!(
+                        "pid {} admitted — child of pid {}, connecting to {}:{}",
+                        p, ppid, dst_ip, dst_port
+                    ),
+                );
+                policy::add_unvalidated(policy_state, p);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// What handle_capture decided about a captured packet.
 ///
 /// Passthrough packets are NOT sent here: they are handed back as owned
@@ -587,6 +697,7 @@ fn handle_capture(
     packet: WinDivertPacket<'_, NetworkLayer>,
     policy_state: &PolicyState,
     flows: &FlowTable,
+    admit_cache: &mut AdmitCache,
     tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
     udp_flows: &mut HashMap<UdpKey, UdpFlow>,
     sockets: &mut SocketSet<'static>,
@@ -661,72 +772,38 @@ fn handle_capture(
     //   4. otherwise → pass through to the default route
     //
     // Identity validation runs only for packets that would open a new flow
-    // (cheap hash pre-check): per-packet fresh-resolves would stall the
-    // loop, but new flows are rare enough for one OpenProcess each.
+    // (cheap hash pre-check): per-packet fresh-resolves would stall the loop,
+    // but new flows are rare enough for one OpenProcess each. Repeat packets
+    // are answered from AdmitCache (see there).
     let flow_key_exists = if is_tcp {
         tcp_flows.contains_key(&TcpKey { src_ip, src_port, dst_ip, dst_port })
     } else {
         udp_flows.contains_key(&UdpKey { src_ip, src_port, dst_ip, dst_port })
     };
     let is_new_flow = !flow_key_exists;
+    // Verdict shape: a NEW flow always walks the full chain (identity
+    // revalidation + auto-tunnel admission live there); repeat packets of an
+    // open flow are served from the TTL cache, so the per-packet path pays
+    // one hash lookup instead of resolve() + tunneled::matches() +
+    // parent_of() (see AdmitCache).
     let is_tunneled = match pid {
-        Some(p) if policy_admit(policy_state, resolver, p, is_new_flow) => true,
-        Some(p) => {
-            if let Some(info) = resolver.resolve(p) {
-                if tunneled::matches(tunneled_paths, std::path::Path::new(&info.exe_path)) {
-                    tracing::info!(
-                        "auto-tunnel (packet): pid={} matches {}",
-                        p, info.exe_path
-                    );
-                    bus.emit(
-                        EventKind::AppAdmitted,
-                        format!("\"{}\" (pid {}) admitted — path match, connecting to {}:{}", info.exe_name, p, dst_ip, dst_port),
-                    );
-                    policy::add(policy_state, p, &info.exe_path);
-                    bus.pid_paths.insert(p, info.exe_path);
-                    true
-                } else if let Some(ppid) = resolver.parent_of(p) {
-                    if policy_admit(policy_state, resolver, ppid, true) {
-                        tracing::info!(
-                            "auto-tunnel (packet child): pid={} parent={} exe={}",
-                            p, ppid, info.exe_path
-                        );
-                        bus.emit(
-                            EventKind::AppAdmitted,
-                            format!(
-                                "\"{}\" (pid {}) admitted — child of pid {}, connecting to {}:{}",
-                                info.exe_name, p, ppid, dst_ip, dst_port
-                            ),
-                        );
-                        policy::add(policy_state, p, &info.exe_path);
-                        bus.pid_paths.insert(p, info.exe_path);
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                // No exe path (yet) — still check parent inheritance so
-                // short-lived children of tunneled parents don't escape.
-                match resolver.parent_of(p) {
-                    Some(ppid) if policy_admit(policy_state, resolver, ppid, true) => {
-                        tracing::info!(
-                            "auto-tunnel (packet child, no exe): pid={} parent={}",
-                            p, ppid
-                        );
-                        bus.emit(
-                            EventKind::AppAdmitted,
-                            format!("pid {} admitted — child of pid {}, connecting to {}:{}", p, ppid, dst_ip, dst_port),
-                        );
-                        policy::add_unvalidated(policy_state, p);
-                        true
-                    }
-                    _ => false,
-                }
-            }
+        Some(p) if is_new_flow => {
+            let verdict = evaluate_admission(
+                policy_state, resolver, tunneled_paths, bus, p, true, dst_ip, dst_port,
+            );
+            admit_cache.put(p, verdict);
+            verdict
         }
+        Some(p) => match admit_cache.get(p) {
+            Some(verdict) => verdict,
+            None => {
+                let verdict = evaluate_admission(
+                    policy_state, resolver, tunneled_paths, bus, p, false, dst_ip, dst_port,
+                );
+                admit_cache.put(p, verdict);
+                verdict
+            }
+        },
         None => false,
     };
 
@@ -906,10 +983,12 @@ fn service_tcp_flows(
     for (key, flow) in tcp_flows.iter_mut() {
         match &mut flow.state {
             TcpState::Pending => {
-                // Half-open that never completes (blackholed SYN, app gave
-                // up): free the key instead of burning the ephemeral port
-                // forever — the next SYN for it must build a fresh listener.
-                if now.duration_since(flow.last_active) > Duration::from_secs(30) {
+                // Half-open that never completes (app abandoned the raced
+                // socket, blackholed SYN): free the key instead of burning
+                // the 4-tuple — the next SYN for it must build a fresh
+                // listener (see PENDING_TCP_TIMEOUT).
+                if now.duration_since(flow.last_active) > PENDING_TCP_TIMEOUT {
+                    stats.pending_timeouts.fetch_add(1, Ordering::Relaxed);
                     close_note(
                         &bus,
                         flow,
@@ -921,7 +1000,7 @@ fn service_tcp_flows(
                     let socket = sockets.get_mut::<tcp::Socket>(flow.handle);
                     if matches!(socket.state(), tcp::State::Closed) {
                         // RST before the handshake completed: retire now
-                        // instead of squatting the key for the 30s timeout.
+                        // instead of waiting out PENDING_TCP_TIMEOUT.
                         close_note(&bus, flow, key, "rst-before-connect");
                         flow.state = TcpState::Closed;
                     } else if socket.state() == tcp::State::Established {
@@ -1212,10 +1291,12 @@ async fn tcp_bridge(
     mut from_app: mpsc::Receiver<Vec<u8>>,
     to_app: mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
-    // 15s connect cap: into a dead/blackholed tunnel, connect() would hang
-    // for minutes with zero visibility (no BridgeFailed, app just stalls).
-    // Failing fast retires the flow, frees the key, and tells the log why.
-    const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+    // 5s connect cap (was 15s): app-side data is already queued by the time
+    // this runs, so a longer cap only delays the failure. A dead/blackholed
+    // tunnel now retires the flow — and logs BridgeFailed — in 5s instead of
+    // stalling the app for 15, while still covering slow but live
+    // destinations (SYN-ACK RTT well under 5s is the norm even via VPN).
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
     let stream = match target {
         Some(t) => {
             let socket = tokio::net::TcpSocket::new_v4()?;
@@ -1445,6 +1526,11 @@ struct Stats {
     injected: AtomicU64,
     bridges_opened: AtomicU64,
     bridges_closed: AtomicU64,
+    /// Flows retired by PENDING_TCP_TIMEOUT: the app never completed the
+    /// local handshake. Chrome's racing losers dominate this count; a spike
+    /// beyond "races observed" would implicate our SYN-ACK injection under
+    /// load (see PENDING_TCP_TIMEOUT).
+    pending_timeouts: AtomicU64,
     /// Used only by the 5s report to turn a top PID into an exe name.
     resolver: Arc<Resolver>,
     bus: Arc<StatusBus>,
@@ -1471,6 +1557,7 @@ impl Stats {
             injected: AtomicU64::new(0),
             bridges_opened: AtomicU64::new(0),
             bridges_closed: AtomicU64::new(0),
+            pending_timeouts: AtomicU64::new(0),
             resolver,
             bus,
         }
@@ -1504,7 +1591,7 @@ impl Stats {
     fn report_loop(&self) {
         let start = Instant::now();
         let mut last = [0u64; 7];
-        let mut last2 = [0u64; 7];
+        let mut last2 = [0u64; 8];
         let mut last3 = [0u64; 4];
         loop {
             std::thread::sleep(Duration::from_secs(5));
@@ -1535,14 +1622,15 @@ impl Stats {
                 self.pass_vpn_down.load(Ordering::Relaxed),
                 self.pid_stalls.load(Ordering::Relaxed),
                 self.recv_err.load(Ordering::Relaxed),
+                self.pending_timeouts.load(Ordering::Relaxed),
                 self.pass_bytes.load(Ordering::Relaxed),
             ];
             let e: Vec<u64> = cur2.iter().zip(&last2).map(|(a, b)| a - b).collect();
             last2 = cur2;
             tracing::info!(
-                "divert 5s detail: malformed={} dns={} untunneled={} vpndown={} pid_stall={} recv_err={} passthrough={}B ({:.2} mbps)",
-                e[0], e[1], e[2], e[3], e[4], e[5], e[6],
-                (e[6] as f64) * 8.0 / 5.0 / 1_000_000.0
+                "divert 5s detail: malformed={} dns={} untunneled={} vpndown={} pid_stall={} recv_err={} pending_timeout={} passthrough={}B ({:.2} mbps)",
+                e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7],
+                (e[7] as f64) * 8.0 / 5.0 / 1_000_000.0
             );
             // Who owns the untunneled floor? Top 5 destinations this window.
             let mut top: Vec<((u8, u16, u32), u64)> = self

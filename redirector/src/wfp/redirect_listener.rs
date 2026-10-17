@@ -22,7 +22,11 @@ use crate::vpn_state::{self, VpnState};
 use crate::wfp::device;
 use ipc::status::EventKind;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Outbound connect cap, matching divert.rs's tcp_bridge: app data is
+/// already queued when the relay starts, so a long cap only delays the
+/// failure — 5s retires the flow and logs while still covering slow but
+/// live destinations.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_BUF: usize = 65536;
 /// Rate-limit for repeated "no original-dst" failures on the same app src,
