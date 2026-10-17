@@ -14,7 +14,8 @@ mod tunneled;
 mod vpn_state;
 mod wfp;
 
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
@@ -36,12 +37,26 @@ fn main() -> Result<()> {
         status_server::append_raw_line(&format!("PANIC: {}{}", payload, location));
     }));
 
+    let log_path = redirector_log_path();
     tracing_subscriber::fmt()
         .with_env_filter(
+            // The UI launches the redirector hidden with no RUST_LOG set, so
+            // fall back to a filter that always keeps our own debug stream in
+            // the file, and to full packet-level detail when the sentinel file
+            // %AppData%\VpnClient\verbose.flag exists.
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter())),
         )
+        // The service runs hidden with stderr attached to nothing, so the only
+        // diagnostic we have (the "divert 5s" counters, inject warnings) was
+        // being discarded. Tee every event to
+        // %LocalAppData%\VpnClient\runtime\redirector.log so a slow-path
+        // investigation has evidence after the fact.
+        .with_writer(LogTee::new(log_path.clone()))
         .init();
+    if let Some(p) = log_path.as_ref() {
+        tracing::info!("redirector log -> {}", p.display());
+    }
 
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
@@ -206,6 +221,107 @@ fn run_observe_wfp() -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// Default log filter when RUST_LOG is unset (always, when the UI spawns us).
+/// `redirector=debug` keeps the service's own diagnostics; creating
+/// `%AppData%\VpnClient\verbose.flag` additionally turns on the `pkt` target,
+/// which traces every captured packet. Sentinel instead of an env var because
+/// the hidden UI-launched process never sees RUST_LOG.
+fn default_filter() -> String {
+    let verbose = std::env::var("APPDATA")
+        .ok()
+        .map(|a| PathBuf::from(a).join("VpnClient").join("verbose.flag"))
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    if verbose {
+        "info,redirector=debug,pkt=debug".to_string()
+    } else {
+        "info,redirector=debug".to_string()
+    }
+}
+
+/// %LocalAppData%\VpnClient\runtime\redirector.log — same runtime dir as
+/// activity.log / mode.txt / openvpn.log. The redirector is the only one of
+/// those that had no file of its own.
+fn redirector_log_path() -> Option<PathBuf> {
+    let local = std::env::var("LOCALAPPDATA").ok()?;
+    Some(
+        PathBuf::from(local)
+            .join("VpnClient")
+            .join("runtime")
+            .join("redirector.log"),
+    )
+}
+
+/// Keep the log bounded across restarts: append normally, but truncate a
+/// file that has already grown past the cap so a long-lived service cannot
+/// fill the disk.
+const REDIRECTOR_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// `tracing` writer that mirrors to stderr (visible when run from a console)
+/// and, when the runtime dir is writable, to a file. A failed open degrades
+/// to stderr-only: logging must never break the packet path.
+#[derive(Clone, Default)]
+struct LogTee {
+    file: Option<Arc<Mutex<std::fs::File>>>,
+}
+
+impl LogTee {
+    fn new(path: Option<PathBuf>) -> Self {
+        let file = path.and_then(|p| {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let oversized = std::fs::metadata(&p)
+                .map(|m| m.len() > REDIRECTOR_LOG_MAX_BYTES)
+                .unwrap_or(false);
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).write(true);
+            if oversized {
+                opts.truncate(true);
+            } else {
+                opts.append(true);
+            }
+            opts.open(p).ok().map(|f| Arc::new(Mutex::new(f)))
+        });
+        Self { file }
+    }
+}
+
+struct LogTeeWriter<'a> {
+    file: Option<std::sync::MutexGuard<'a, std::fs::File>>,
+}
+
+impl std::io::Write for LogTeeWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::stderr().write_all(buf);
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.write_all(buf);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::stderr().flush();
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.flush();
+        }
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogTee {
+    type Writer = LogTeeWriter<'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogTeeWriter {
+            file: self
+                .file
+                .as_ref()
+                .map(|f| f.lock().unwrap_or_else(|e| e.into_inner())),
+        }
+    }
 }
 
 fn print_help() {

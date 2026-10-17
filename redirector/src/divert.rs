@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -35,6 +35,27 @@ const SMOLTCP_CHUNK: usize = 16 * 1024;
 const SMOLTCP_BUF: usize = 256 * 1024;
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// WinDivert capture filter — NETWORK layer, outbound TCP/UDP. The DNS /
+/// mDNS / LLMNR ports are excluded so that name chatter never pays the
+/// userspace round-trip (see the NOTE in `run`).
+///
+/// GRAMMAR + SEMANTIC GOTCHAS (regression guards `capture_filter_compiles`
+/// and `capture_filter_semantics`):
+///
+///   1. WinDivert 2.2 accepts `not` / `!` **only** as a prefix on a single
+///      field (`!loopback`); `not (expr)` / `!(expr)` is a PARSE error, and a
+///      parse error makes `WinDivertOpen` fail with ERROR_INVALID_PARAMETER
+///      (87), aborting the backend. (A non-elevated run fails *earlier* with
+///      ERROR_ACCESS_DENIED, hiding this until the process is elevated.)
+///   2. A field of an ABSENT layer evaluates FALSE, not zero. On a UDP packet
+///      `tcp.DstPort != 53` is therefore false, so flattening the negation
+///      into `tcp.DstPort != 53 and udp.DstPort != 53` matches NOTHING (no
+///      packet is both TCP and UDP). The negated group must be split into
+///      per-protocol branches, each guarded by its own `tcp` / `udp` test.
+pub(crate) const CAPTURE_FILTER: &str = "outbound and ip and !loopback and \
+     ((tcp and tcp.DstPort != 53) \
+      or (udp and udp.DstPort != 53 and udp.DstPort != 5353 and udp.DstPort != 5355))";
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     policy_state: PolicyState,
@@ -47,15 +68,18 @@ pub fn run(
     // NOTE on "why can't untunneled traffic fully bypass us": WinDivert's
     // NETWORK layer carries no PID, so the filter cannot exclude apps —
     // every matching packet MUST visit userspace for a verdict. The tax is
-    // minimized instead: (a) this filter excludes ports that can never need
-    // tunneling (DNS + link-local name chatter) so they skip the queue trip
-    // entirely, (b) the divert loop batches + never blocks on verdicts, (c)
-    // divert.rs still early-returns port 53 as backstop.
-    let capture_filter = "outbound and ip and (tcp or udp) and !loopback \
-        and not (tcp.DstPort == 53 or udp.DstPort == 53 \
-        or udp.DstPort == 5353 or udp.DstPort == 5355)";
+    // minimized instead: (a) CAPTURE_FILTER excludes ports that can never
+    // need tunneling (DNS + link-local name chatter) so they skip the queue
+    // trip entirely, (b) the divert loop batches + never blocks on verdicts,
+    // (c) divert.rs still early-returns port 53 as backstop.
+    let capture_filter = CAPTURE_FILTER;
     let capture = WinDivert::network(capture_filter, 1040, WinDivertFlags::new())
-        .context("WinDivert::network capture handle failed (need admin)")?;
+        .with_context(|| {
+            format!(
+                "WinDivert::network capture handle failed (elevated shell + valid filter required; \
+                 filter={capture_filter})"
+            )
+        })?;
     // Deepen the driver queue (default 4096 packets / 4MB; max 16384 / 32MB):
     // under flood (speedtest = tens of thousands of pps) a shallow queue
     // drops before our loop drains it. Best-effort: a failure here must not
@@ -95,7 +119,7 @@ pub fn run(
     let mut tcp_flows: HashMap<TcpKey, TcpFlow> = HashMap::new();
     let mut udp_flows: HashMap<UdpKey, UdpFlow> = HashMap::new();
 
-    let stats = Arc::new(Stats::new(bus.clone()));
+    let stats = Arc::new(Stats::new(bus.clone(), resolver.clone()));
     let stats_clone = stats.clone();
     std::thread::spawn(move || stats_clone.report_loop());
 
@@ -118,7 +142,11 @@ pub fn run(
             last_vpn = now_vpn;
         }
 
+        let t_recv = Instant::now();
         let recv_result = capture.recv_wait(&mut buffer, 50);
+        if recv_result.is_err() {
+            stats.recv_err.fetch_add(1, Ordering::Relaxed);
+        }
         if let Ok(Some(packet)) = recv_result {
             let decision = handle_capture(
                 packet,
@@ -143,32 +171,44 @@ pub fn run(
             // collapses under flood (service scans every flow per packet).
             // Batching amortizes each cycle over up to CAPTURE_BATCH packets
             // — this also unclogs UNTUNNELED traffic sharing the same queue.
-            for _ in 1..CAPTURE_BATCH {
-                match capture.recv_wait(&mut buffer, 0) {
-                    Ok(Some(packet)) => {
-                        match handle_capture(
-                            packet,
-                            &policy_state,
-                            &flows,
-                            &mut tcp_flows,
-                            &mut udp_flows,
-                            &mut sockets,
-                            &mut device,
-                            &tokio_handle,
-                            now_vpn,
-                            &stats,
-                            &resolver,
-                            &tunneled_paths,
-                            &bus,
-                        ) {
-                            Captured::Passthrough(data) => passthrough.push(data),
-                            Captured::Consumed => {}
+            // Each round is ONE WinDivertRecvEx returning up to RECV_BATCH
+            // packets, where the old shape paid RecvEx + WaitForSingleObject +
+            // GetOverlappedResult for every single packet.
+            for _ in 0..MAX_DRAIN_ROUNDS {
+                match capture.recv_wait_ex(&mut buffer, RECV_BATCH as u8, 0) {
+                    Ok(packets) => {
+                        if packets.is_empty() {
+                            break;
+                        }
+                        for packet in packets {
+                            match handle_capture(
+                                packet,
+                                &policy_state,
+                                &flows,
+                                &mut tcp_flows,
+                                &mut udp_flows,
+                                &mut sockets,
+                                &mut device,
+                                &tokio_handle,
+                                now_vpn,
+                                &stats,
+                                &resolver,
+                                &tunneled_paths,
+                                &bus,
+                            ) {
+                                Captured::Passthrough(data) => passthrough.push(data),
+                                Captured::Consumed => {}
+                            }
                         }
                     }
-                    _ => break,
+                    Err(_) => {
+                        stats.recv_err.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
                 }
             }
         }
+        let t_flush = Instant::now();
 
         // One overlapped syscall for the whole batch instead of one per
         // packet: this is the dominant cost of untunneled traffic under
@@ -188,6 +228,9 @@ pub fn run(
                     data: Cow::Owned(data),
                 });
             }
+            stats
+                .pass_bytes
+                .fetch_add(expected_bytes as u64, Ordering::Relaxed);
             let count = send_batch.len();
             // send_ex returns TOTAL BYTES injected, not a packet count: a
             // short Ok(n) means the tail of the batch never hit the wire.
@@ -217,6 +260,7 @@ pub fn run(
             // poll()/service_* until the next flush.
             send_batch.clear();
         }
+        let t_svc = Instant::now();
 
         let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
         drain_tx(&mut device, &inject, &stats);
@@ -234,6 +278,23 @@ pub fn run(
 
         let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
         drain_tx(&mut device, &inject, &stats);
+
+        // Where does each iteration actually go? Logged every 5s so a
+        // throughput ceiling can be attributed to a phase instead of guessed.
+        // us_recv includes the 50ms idle wait, so a large value means "idle".
+        stats.loops.fetch_add(1, Ordering::Relaxed);
+        stats.us_recv.fetch_add(
+            t_flush.duration_since(t_recv).as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        stats.us_flush.fetch_add(
+            t_svc.duration_since(t_flush).as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        stats.us_svc.fetch_add(
+            Instant::now().duration_since(t_svc).as_micros() as u64,
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -296,6 +357,18 @@ const MTU_PAYLOAD: usize = 1500;
 /// Packets handled per loop iteration (poll+service amortized across them).
 /// 64 keeps per-iteration work bounded while draining floods.
 const CAPTURE_BATCH: usize = 64;
+/// Packets per batched WinDivertRecvEx. Bounded by the 64 KiB capture buffer
+/// (16 x 1500 B = 24 KiB), so the driver always has room for the batch.
+const RECV_BATCH: usize = 16;
+/// Batched drain rounds per loop iteration: 1 + 4 x 16 = 65 packets max, the
+/// same per-iteration bound CAPTURE_BATCH expressed, but reachable with 5
+/// syscall round-trips instead of 65.
+const MAX_DRAIN_ROUNDS: usize = 4;
+/// How long a failed PID resolution suppresses further attempts for the same
+/// local endpoint. Short enough that a flow which becomes resolvable is picked
+/// up quickly; long enough that a bulk flow which can never be resolved does
+/// not pay the ~1 ms wait on every packet.
+const PID_NEG_TTL: Duration = Duration::from_millis(250);
 
 /// Keyed on the FULL 4-tuple: without dst, an ephemeral port reused for a
 /// different destination collides with the old flow and gets RST'd.
@@ -412,22 +485,54 @@ fn resolve_pid_with_retry(
     flows: &FlowTable,
     src_ip: Ipv4Addr,
     src_port: u16,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
     proto: u8,
+    stats: &Stats,
 ) -> Option<u32> {
+    // TCP rows carry the full 4-tuple, so hand the destination over for an
+    // exact match. UDP rows have no remote to match on.
+    let remote = if proto == PROTO_TCP {
+        Some((dst_ip, dst_port))
+    } else {
+        None
+    };
     let lookup = |flows: &FlowTable| -> Option<u32> {
         flows::lookup_with_wildcard(flows, IpAddr::V4(src_ip), src_port, proto)
             .map(|e| e.pid)
-            .or_else(|| pidlookup::pid_for_local_v4(src_ip, src_port, proto))
+            .or_else(|| pidlookup::pid_for_local_v4(src_ip, src_port, proto, remote))
     };
 
     if let Some(p) = lookup(flows) {
         return Some(p);
     }
+    // A flow that just failed is not retried for PID_NEG_TTL. Without this a
+    // bulk flow whose owner can never be resolved (kernel-generated, or racing
+    // the socket table) pays the ~1 ms wait on EVERY packet, which caps the
+    // whole single-threaded loop.
+    let neg_key = (proto, src_port, u32::from(src_ip));
+    if let Ok(neg) = stats.neg_pid.lock() {
+        if let Some(at) = neg.get(&neg_key) {
+            if at.elapsed() < PID_NEG_TTL {
+                return None;
+            }
+        }
+    }
+    // Missed both the observer flow table and the live IPHLPAPI tables: this
+    // packet is about to sleep up to 5 x 200 us. Counted so the 5s report can
+    // prove (or kill) the "PID stalls cap the loop" theory.
+    stats.pid_stalls.fetch_add(1, Ordering::Relaxed);
     for _ in 0..5 {
         std::thread::sleep(Duration::from_micros(200));
         if let Some(p) = lookup(flows) {
             return Some(p);
         }
+    }
+    if let Ok(mut neg) = stats.neg_pid.lock() {
+        if neg.len() >= 4096 {
+            neg.retain(|_, at| at.elapsed() < PID_NEG_TTL);
+        }
+        neg.insert(neg_key, Instant::now());
     }
     None
 }
@@ -496,7 +601,7 @@ fn handle_capture(
     let parsed = match parse_ipv4_l4(&packet.data) {
         Some(p) => p,
         None => {
-            stats.passed.fetch_add(1, Ordering::Relaxed);
+            stats.pass_malformed.fetch_add(1, Ordering::Relaxed);
             return Captured::Passthrough(packet.data.into_owned());
         }
     };
@@ -529,11 +634,11 @@ fn handle_capture(
     // Bonus: skipping PID resolution + admission here keeps the hot path
     // short for the highest-rate flow class on the box.
     if dst_port == 53 || dst_port == 5353 || dst_port == 5355 {
-        stats.passed.fetch_add(1, Ordering::Relaxed);
+        stats.pass_dns.fetch_add(1, Ordering::Relaxed);
         return Captured::Passthrough(packet.data.into_owned());
     }
 
-    let pid = resolve_pid_with_retry(flows, src_ip, src_port, proto);
+    let pid = resolve_pid_with_retry(flows, src_ip, src_port, dst_ip, dst_port, proto, stats);
     if let Some(p) = pid {
         // Only take the write lock when the cached PID actually differs.
         // Merely testing presence would freeze a stale entry forever (the
@@ -626,7 +731,20 @@ fn handle_capture(
     };
 
     if !is_tunneled {
-        stats.passed.fetch_add(1, Ordering::Relaxed);
+        // Opt-in packet trace: enable with RUST_LOG=pkt=debug. Deliberately a
+        // target outside `redirector` so the default `redirector=debug` filter
+        // does NOT turn on per-packet logging (that would flood the file).
+        tracing::debug!(
+            target: "pkt",
+            "untun pid={:?} {}/{} -> {}:{}",
+            pid,
+            if is_tcp { "tcp" } else { "udp" },
+            src_port,
+            dst_ip,
+            dst_port
+        );
+        stats.pass_untun.fetch_add(1, Ordering::Relaxed);
+        stats.note_untun(proto, dst_port, dst_ip, pid);
         return Captured::Passthrough(packet.data.into_owned());
     }
     let pid = pid.unwrap();
@@ -639,7 +757,7 @@ fn handle_capture(
     // will see a RST and reconnect — and that reconnect goes straight
     // through here.
     if vpn_target.is_none() {
-        stats.passed.fetch_add(1, Ordering::Relaxed);
+        stats.pass_vpn_down.fetch_add(1, Ordering::Relaxed);
         return Captured::Passthrough(packet.data.into_owned());
     }
 
@@ -1290,22 +1408,70 @@ fn build_udp_packet(
 }
 
 struct Stats {
-    passed: AtomicU64,
+    /// Passthrough, split by the branch that decided it — a single "passed"
+    /// counter could not tell malformed input from plain non-tunneled traffic,
+    /// which is exactly what made the constant ~190 pps floor unreadable.
+    pass_malformed: AtomicU64,
+    pass_dns: AtomicU64,
+    pass_untun: AtomicU64,
+    pass_vpn_down: AtomicU64,
+    /// Packets that missed the fast flow-table/pidlookup path and paid the
+    /// ~1 ms retry loop (the prime suspect for a userspace pps ceiling).
+    pid_stalls: AtomicU64,
+    /// Local endpoints that recently failed PID resolution, keyed
+    /// (proto, src_port, src_ip). See PID_NEG_TTL.
+    neg_pid: Mutex<HashMap<(u8, u16, u32), Instant>>,
+    /// Bytes handed back to the kernel as passthrough (all passthrough
+    /// classes). The tunneled byte counters (bus.bytes_*) say nothing about
+    /// untunneled throughput, so this is the only way to compare what we
+    /// actually carried against what the browser reports.
+    pass_bytes: AtomicU64,
+    /// WinDivert recv errors. A full queue drops packets inside the driver
+    /// where we cannot see them; a recv error at least proves starvation.
+    recv_err: AtomicU64,
+    /// Outer-loop iterations and the microseconds spent in each phase, summed
+    /// since the last 5s report is derived from the totals.
+    loops: AtomicU64,
+    us_recv: AtomicU64,
+    us_flush: AtomicU64,
+    us_svc: AtomicU64,
+    /// Untunneled packets attributed to (proto, dst_port, dst_ip) since the
+    /// last 5s report. Naming the floor's owner is the whole point.
+    untun_dst: Mutex<HashMap<(u8, u16, u32), u64>>,
+    /// Same, by owning PID (0 = unresolved), so the report can name the app
+    /// (e.g. firefox.exe) rather than only a destination.
+    untun_pid: Mutex<HashMap<u32, u64>>,
     captured: AtomicU64,
     injected: AtomicU64,
     bridges_opened: AtomicU64,
     bridges_closed: AtomicU64,
+    /// Used only by the 5s report to turn a top PID into an exe name.
+    resolver: Arc<Resolver>,
     bus: Arc<StatusBus>,
 }
 
 impl Stats {
-    fn new(bus: Arc<StatusBus>) -> Self {
+    fn new(bus: Arc<StatusBus>, resolver: Arc<Resolver>) -> Self {
         Self {
-            passed: AtomicU64::new(0),
+            pass_malformed: AtomicU64::new(0),
+            pass_dns: AtomicU64::new(0),
+            pass_untun: AtomicU64::new(0),
+            pass_vpn_down: AtomicU64::new(0),
+            pid_stalls: AtomicU64::new(0),
+            neg_pid: Mutex::new(HashMap::new()),
+            pass_bytes: AtomicU64::new(0),
+            recv_err: AtomicU64::new(0),
+            loops: AtomicU64::new(0),
+            us_recv: AtomicU64::new(0),
+            us_flush: AtomicU64::new(0),
+            us_svc: AtomicU64::new(0),
+            untun_dst: Mutex::new(HashMap::new()),
+            untun_pid: Mutex::new(HashMap::new()),
             captured: AtomicU64::new(0),
             injected: AtomicU64::new(0),
             bridges_opened: AtomicU64::new(0),
             bridges_closed: AtomicU64::new(0),
+            resolver,
             bus,
         }
     }
@@ -1323,13 +1489,30 @@ impl Stats {
         self.bus.add_pid_in(pid, n);
     }
 
+    /// Attribute an untunneled packet to its destination so the 5s report can
+    /// name whatever produces the constant passthrough floor. The lock is
+    /// uncontended: this runs only on the single divert thread.
+    fn note_untun(&self, proto: u8, dst_port: u16, dst_ip: Ipv4Addr, pid: Option<u32>) {
+        if let Ok(mut m) = self.untun_dst.lock() {
+            *m.entry((proto, dst_port, u32::from(dst_ip))).or_insert(0) += 1;
+        }
+        if let Ok(mut m) = self.untun_pid.lock() {
+            *m.entry(pid.unwrap_or(0)).or_insert(0) += 1;
+        }
+    }
+
     fn report_loop(&self) {
         let start = Instant::now();
         let mut last = [0u64; 7];
+        let mut last2 = [0u64; 7];
+        let mut last3 = [0u64; 4];
         loop {
             std::thread::sleep(Duration::from_secs(5));
             let cur = [
-                self.passed.load(Ordering::Relaxed),
+                self.pass_malformed.load(Ordering::Relaxed)
+                    + self.pass_dns.load(Ordering::Relaxed)
+                    + self.pass_untun.load(Ordering::Relaxed)
+                    + self.pass_vpn_down.load(Ordering::Relaxed),
                 self.captured.load(Ordering::Relaxed),
                 self.injected.load(Ordering::Relaxed),
                 self.bridges_opened.load(Ordering::Relaxed),
@@ -1343,6 +1526,185 @@ impl Stats {
                 "divert 5s: pass={} cap={} inj={} bridges +{}/-{} a→r={}B r→a={}B (uptime {:?})",
                 d[0], d[1], d[2], d[3], d[4], d[5], d[6], start.elapsed()
             );
+            // Passthrough breakdown (5s deltas): which branch produced the
+            // floor, and how often the ~1 ms PID retry loop was paid.
+            let cur2 = [
+                self.pass_malformed.load(Ordering::Relaxed),
+                self.pass_dns.load(Ordering::Relaxed),
+                self.pass_untun.load(Ordering::Relaxed),
+                self.pass_vpn_down.load(Ordering::Relaxed),
+                self.pid_stalls.load(Ordering::Relaxed),
+                self.recv_err.load(Ordering::Relaxed),
+                self.pass_bytes.load(Ordering::Relaxed),
+            ];
+            let e: Vec<u64> = cur2.iter().zip(&last2).map(|(a, b)| a - b).collect();
+            last2 = cur2;
+            tracing::info!(
+                "divert 5s detail: malformed={} dns={} untunneled={} vpndown={} pid_stall={} recv_err={} passthrough={}B ({:.2} mbps)",
+                e[0], e[1], e[2], e[3], e[4], e[5], e[6],
+                (e[6] as f64) * 8.0 / 5.0 / 1_000_000.0
+            );
+            // Who owns the untunneled floor? Top 5 destinations this window.
+            let mut top: Vec<((u8, u16, u32), u64)> = self
+                .untun_dst
+                .lock()
+                .map(|mut m| m.drain().collect())
+                .unwrap_or_default();
+            top.sort_by(|a, b| b.1.cmp(&a.1));
+            let top_str = top
+                .iter()
+                .take(5)
+                .map(|((proto, port, ip), n)| {
+                    format!(
+                        "{}{}:{}={}",
+                        if *proto == PROTO_TCP { "tcp/" } else { "udp/" },
+                        Ipv4Addr::from(*ip),
+                        port,
+                        n
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!("divert 5s untunneled top: {}", top_str);
+            // And by owning process, so the floor is named (firefox.exe, ...).
+            let mut topp: Vec<(u32, u64)> = self
+                .untun_pid
+                .lock()
+                .map(|mut m| m.drain().collect())
+                .unwrap_or_default();
+            topp.sort_by(|a, b| b.1.cmp(&a.1));
+            let topp_str = topp
+                .iter()
+                .take(5)
+                .map(|(pid, n)| {
+                    if *pid == 0 {
+                        format!("unresolved={}", n)
+                    } else {
+                        let name = self
+                            .resolver
+                            .resolve(*pid)
+                            .map(|i| i.exe_name)
+                            .unwrap_or_else(|| format!("pid{}", pid));
+                        format!("{}={}", name, n)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!("divert 5s untunneled by pid: {}", topp_str);
+            // Phase timing: if iters/s is pinned low while pkts/iter is ~1,
+            // the loop itself (not the traffic) is the throughput ceiling.
+            let cur3 = [
+                self.loops.load(Ordering::Relaxed),
+                self.us_recv.load(Ordering::Relaxed),
+                self.us_flush.load(Ordering::Relaxed),
+                self.us_svc.load(Ordering::Relaxed),
+            ];
+            let f: Vec<u64> = cur3.iter().zip(&last3).map(|(a, b)| a - b).collect();
+            last3 = cur3;
+            let handled = d[0] + d[1];
+            tracing::info!(
+                "divert 5s loop: iters={} handled={} pkts/iter={:.2} recv={}ms flush={}ms svc={}ms",
+                f[0],
+                handled,
+                if f[0] > 0 { handled as f64 / f[0] as f64 } else { 0.0 },
+                f[1] / 1000,
+                f[2] / 1000,
+                f[3] / 1000
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CAPTURE_FILTER;
+    use crate::flows::{PROTO_TCP, PROTO_UDP};
+    use std::ffi::{c_char, c_void, CStr, CString};
+
+    /// Regression guard for the Oct-16 breakage: `not (...)` is a WinDivert
+    /// parse error, which becomes ERROR_INVALID_PARAMETER (87) on
+    /// `WinDivertOpen` and aborts the backend. `WinDivertHelperCompileFilter`
+    /// validates the exact string we hand to WinDivert with no driver and no
+    /// elevation, so this test fails loudly if the filter is ever made
+    /// unparseable again.
+    #[test]
+    fn capture_filter_compiles() {
+        let filter = CString::new(CAPTURE_FILTER).expect("filter has no NUL");
+        let mut object: Vec<c_char> = vec![0; 8192];
+        let mut error_str: *const c_char = std::ptr::null();
+        let mut error_pos: u32 = 0;
+        let ok = unsafe {
+            windivert_sys::WinDivertHelperCompileFilter(
+                filter.as_ptr(),
+                windivert_sys::WinDivertLayer::Network,
+                object.as_mut_ptr(),
+                object.len() as u32,
+                &mut error_str,
+                &mut error_pos,
+            )
+        };
+        let detail = if error_str.is_null() {
+            "(no error string)".to_string()
+        } else {
+            unsafe { CStr::from_ptr(error_str) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_ne!(ok, 0, "WinDivert rejected CAPTURE_FILTER at pos {error_pos}: {detail}");
+    }
+
+    /// Regression guard for the follow-on breakage: a filter can compile yet
+    /// match NOTHING. WinDivert evaluates an absent layer's field as false, so
+    /// a flat `tcp.DstPort != 53 and udp.DstPort != 53` conjunction silently
+    /// drops every packet. This evals crafted outbound IPv4 TCP/UDP frames
+    /// against the real filter (no driver/elevation needed) and asserts the
+    /// actual capture verdicts.
+    #[test]
+    fn capture_filter_semantics() {
+        fn ipv4(proto: u8, dst_port: u16) -> Vec<u8> {
+            let mut ip = vec![0u8; 20];
+            ip[0] = 0x45; // IPv4, IHL 5
+            ip[8] = 64; // TTL
+            ip[9] = proto;
+            ip[12..16].copy_from_slice(&[192, 168, 68, 100]);
+            ip[16..20].copy_from_slice(&[1, 1, 1, 1]);
+            let l4_len = if proto == PROTO_TCP { 20 } else { 8 };
+            let mut l4 = vec![0u8; l4_len];
+            l4[0..2].copy_from_slice(&51234u16.to_be_bytes());
+            l4[2..4].copy_from_slice(&dst_port.to_be_bytes());
+            if proto == PROTO_TCP {
+                l4[12] = 0x50; // data offset 5
+            }
+            let total = (20 + l4_len) as u16;
+            ip[2..4].copy_from_slice(&total.to_be_bytes());
+            ip.extend_from_slice(&l4);
+            ip
+        }
+
+        fn captured(pkt: &[u8]) -> bool {
+            // WINDIVERT_ADDRESS: Timestamp(8) + bitfield(4) + reserved(4) +
+            // union(48). Layer = NETWORK(0), Outbound = bit 17 → 0x00020000.
+            let mut addr = [0u8; 64];
+            addr[8..12].copy_from_slice(&(1u32 << 17).to_ne_bytes());
+            let filter = CString::new(CAPTURE_FILTER).expect("filter has no NUL");
+            let ok = unsafe {
+                windivert_sys::WinDivertHelperEvalFilter(
+                    filter.as_ptr(),
+                    pkt.as_ptr() as *const c_void,
+                    pkt.len() as u32,
+                    addr.as_ptr() as *const windivert_sys::address::WINDIVERT_ADDRESS,
+                )
+            };
+            ok != 0
+        }
+
+        // Tunneled-app traffic must be captured...
+        assert!(captured(&ipv4(PROTO_TCP, 443)), "TCP:443 must be captured");
+        assert!(captured(&ipv4(PROTO_UDP, 443)), "UDP:443 must be captured");
+        // ...while DNS / mDNS / LLMNR is skipped.
+        assert!(!captured(&ipv4(PROTO_TCP, 53)), "TCP:53 must be excluded");
+        assert!(!captured(&ipv4(PROTO_UDP, 53)), "UDP:53 must be excluded");
+        assert!(!captured(&ipv4(PROTO_UDP, 5353)), "UDP:5353 must be excluded");
+        assert!(!captured(&ipv4(PROTO_UDP, 5355)), "UDP:5355 must be excluded");
     }
 }
