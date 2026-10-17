@@ -11,6 +11,7 @@ mod stack;
 mod status_server;
 mod tunneled;
 mod vpn_state;
+mod wfp;
 
 use std::sync::Arc;
 
@@ -44,7 +45,50 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         None | Some("adapters") => print_adapters(),
-        Some("observe") => run_observe(),
+        Some("observe") => {
+            // Accept --backend=wfp and --backend wfp; reject typos loudly
+            // instead of silently falling back to WinDivert.
+            let raw = args
+                .iter()
+                .find_map(|a| a.strip_prefix("--backend="))
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    args.windows(2).find_map(|w| {
+                        if w[0] == "--backend" {
+                            Some(w[1].clone())
+                        } else {
+                            None
+                        }
+                    })
+                });
+            let backend = match raw {
+                None => wfp::Backend::default(),
+                Some(s) => match wfp::Backend::parse(&s) {
+                    Some(b) => b,
+                    None => {
+                        eprintln!(
+                            "unknown --backend '{}' (expected windivert|wfp)",
+                            s
+                        );
+                        print_help();
+                        std::process::exit(2);
+                    }
+                },
+            };
+            run_observe(backend)
+        }
+        Some("wfp-status") => {
+            let st = wfp::device::status();
+            println!(
+                "VpnWfpCallout installed={} running={} BFE running={} device_openable={} ({})",
+                st.installed,
+                st.running,
+                st.bfe_running,
+                st.device_openable,
+                wfp::device::DOS_DEVICE
+            );
+            Ok(())
+        }
         Some("help") | Some("--help") | Some("-h") => {
             print_help();
             Ok(())
@@ -57,7 +101,15 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_observe() -> Result<()> {
+fn run_observe(backend: wfp::Backend) -> Result<()> {
+    tracing::info!("redirector backend={:?}", backend);
+    match backend {
+        wfp::Backend::Wfp => run_observe_wfp(),
+        wfp::Backend::WindDivert => run_observe_windivert(),
+    }
+}
+
+fn run_observe_windivert() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -109,13 +161,60 @@ fn run_observe() -> Result<()> {
     })
 }
 
+fn run_observe_wfp() -> Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let policy_state = policy::new();
+        let flows = flows::new();
+        let resolver = Arc::new(process::Resolver::new());
+        let tunneled_paths = tunneled::new();
+
+        let vpn_state = vpn_state::new();
+        let bus = Arc::new(status_server::StatusBus::new());
+
+        let policy_task = tokio::spawn(policy_server::run(policy_state.clone()));
+        let vpn_task = tokio::spawn(vpn_state::watcher(vpn_state.clone(), bus.clone()));
+        let status_task = tokio::spawn(status_server::run(bus.clone(), vpn_state.clone()));
+        let watcher_task = tokio::spawn(proc_watcher::run(
+            policy_state.clone(),
+            bus.clone(),
+            tunneled_paths.clone(),
+            resolver.clone(),
+        ));
+        // WFP replaces observer (SOCKET layer) + divert (NETWORK layer):
+        // PID comes from FWPS_METADATA_FIELD_PROCESS_ID in the kernel,
+        // so no GetExtendedTcpTable race and no smoltcp termination.
+        // No spawn_blocking + nested runtime: run_async lives on this runtime.
+        let wfp_task = tokio::spawn(wfp::run_async(
+            policy_state.clone(),
+            flows.clone(),
+            vpn_state.clone(),
+            bus.clone(),
+            resolver.clone(),
+            tunneled_paths.clone(),
+        ));
+
+        tokio::select! {
+            r = policy_task => r??,
+            r = vpn_task => r??,
+            r = status_task => r??,
+            r = watcher_task => r??,
+            r = wfp_task => r??,
+        }
+        Ok(())
+    })
+}
+
 fn print_help() {
     println!("redirector — VPN per-app routing service");
     println!();
     println!("USAGE:");
-    println!("  redirector [adapters]    List network adapters, flag VPN candidates");
-    println!("  redirector observe       Stream socket events + serve policy pipe (requires admin)");
-    println!("  redirector help          Show this message");
+    println!("  redirector [adapters]              List network adapters, flag VPN candidates");
+    println!("  redirector observe [--backend=windivert|wfp]  Run packet path (requires admin, default windivert)");
+    println!("  redirector wfp-status              Show VpnWfpCallout + BFE service state");
+    println!("  redirector help                    Show this message");
 }
 
 fn print_adapters() -> Result<()> {

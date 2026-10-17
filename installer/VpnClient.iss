@@ -52,11 +52,21 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 ; UI (single self-contained exe — bundles .NET runtime + WPF + Wpf.Ui)
 Source: "{#UiPublishDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 
-; Redirector + WinDivert. The two WinDivert files MUST live next to
-; redirector.exe — WinDivert resolves its driver path relative to its DLL.
+; Redirector + WinDivert (default backend). The two WinDivert files MUST live
+; next to redirector.exe — WinDivert resolves its driver path relative to DLL.
+; Kept even after WFP lands: --backend=windivert is the fail-safe default
+; until VpnWfpCallout is attestation-signed (Secure Boot/HVCI).
 Source: "{#RedirectorDir}\redirector.exe";   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RedirectorDir}\WinDivert.dll";    DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RedirectorDir}\WinDivert64.sys";  DestDir: "{app}"; Flags: ignoreversion
+
+; WFP callout driver (opt-in backend, --backend=wfp). Non-PnP WFPCALLOUTS:
+; installed via InstallHinfSection + sc.exe (see DriverInstall.ps1), not
+; pnputil. Files staged under {app}\driver for the post-install step.
+Source: "..\driver\VpnWfpCallout.inf";     DestDir: "{app}\driver"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\driver\VpnWfpCallout.sys";     DestDir: "{app}\driver"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\driver\ioctl.h";               DestDir: "{app}\driver"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "DriverInstall.ps1";               DestDir: "{app}\driver"; Flags: ignoreversion
 
 ; Bundled OpenVPN Community MSI. Only installed if openvpn.exe isn't found
 ; at the standard path. Extracted to {tmp} and deleted after.
@@ -79,14 +89,16 @@ Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\{#OpenVpnMsi}"" /quiet /noresta
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: shellexec postinstall skipifsilent
 
 [UninstallRun]
-; Make sure nothing is holding the driver open before uninstall removes the
+; Make sure nothing is holding the drivers open before uninstall removes the
 ; files. taskkill releases user-mode handles; sc stop/delete unloads the
-; kernel driver itself — without that, WinDivert64.sys stays locked.
+; kernel drivers — without that, .sys files stay locked.
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM VpnClient.Ui.exe /T"; Flags: runhidden; RunOnceId: "KillUi"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM redirector.exe /T";  Flags: runhidden; RunOnceId: "KillRedirector"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM openvpn.exe /T";     Flags: runhidden; RunOnceId: "KillOpenvpn"
 Filename: "{sys}\sc.exe";       Parameters: "stop WinDivert";            Flags: runhidden; RunOnceId: "StopWinDivert"
 Filename: "{sys}\sc.exe";       Parameters: "delete WinDivert";          Flags: runhidden; RunOnceId: "DeleteWinDivert"
+Filename: "{sys}\sc.exe";       Parameters: "stop VpnWfpCallout";        Flags: runhidden; RunOnceId: "StopWfp"
+Filename: "{sys}\sc.exe";       Parameters: "delete VpnWfpCallout";       Flags: runhidden; RunOnceId: "DeleteWfp"
 
 [Code]
 function OpenVpnInstalled: Boolean;
@@ -109,6 +121,8 @@ begin
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM openvpn.exe',      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(ExpandConstant('{sys}\sc.exe'),       'stop WinDivert',             '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(ExpandConstant('{sys}\sc.exe'),       'delete WinDivert',           '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\sc.exe'),       'stop VpnWfpCallout',         '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\sc.exe'),       'delete VpnWfpCallout',       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   // SCM is async — give it a beat to finish unloading before we replace files.
   Sleep(750);
 end;

@@ -6,7 +6,8 @@
 # Output: installer\Output\VpnClientSetup-<version>.exe
 
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$BuildDriver
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,6 +30,30 @@ if (-not $SkipBuild) {
     Write-Host "[1/3] cargo build --release (redirector)" -ForegroundColor Cyan
     & cargo build --release --manifest-path "$root\redirector\Cargo.toml"
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+
+    Write-Host "[1b/3] WFP driver (optional, needs WDK; -BuildDriver to attempt)" -ForegroundColor Cyan
+    if ($BuildDriver) {
+        $vcxproj = Get-ChildItem "$root\driver\*.vcxproj" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $vcxproj) {
+            Write-Host "  (skip: no driver .vcxproj — see driver/README.md)" -ForegroundColor Yellow
+        } else {
+            $msbuild = Get-Command msbuild -ErrorAction SilentlyContinue
+            if (-not $msbuild) {
+                Write-Host "  (skip: msbuild not in PATH — install VS2022+WDK or run without -BuildDriver; WinDivert default unaffected)" -ForegroundColor Yellow
+            } else {
+                try {
+                    & msbuild $vcxproj.FullName /p:Configuration=Release /p:Platform=x64
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Host "  WARNING: driver build failed ($LASTEXITCODE) — continuing without driver (WinDivert default unaffected)" -ForegroundColor Yellow
+                    }
+                } catch {
+                    Write-Host "  WARNING: driver build threw ($_) — continuing without driver" -ForegroundColor Yellow
+                }
+            }
+        }
+    } else {
+        Write-Host "  (skip: pass -BuildDriver to attempt WDK build; WinDivert backend is default)" -ForegroundColor Yellow
+    }
 
     Write-Host "[2/3] dotnet publish (UI, single-file self-contained)" -ForegroundColor Cyan
     & dotnet publish "$root\dotnet\VpnClient.Ui\VpnClient.Ui.csproj" -c Release --nologo
