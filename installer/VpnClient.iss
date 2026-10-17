@@ -83,6 +83,14 @@ Name: "{autodesktop}\{#MyAppName}";    Filename: "{app}\{#MyAppExeName}"; Tasks:
 ; and the TAP driver (fallback for boxes where Wintun won't load).
 Filename: "msiexec.exe"; Parameters: "/i ""{tmp}\{#OpenVpnMsi}"" /quiet /norestart ADDLOCAL=OpenVPN.Service,Drivers,Drivers.Wintun,Drivers.TAPWindows6"; StatusMsg: "Installing OpenVPN Community ({#OpenVpnVersion}) ..."; Flags: waituntilterminated; Check: not OpenVpnInstalled
 
+; Install the WFP callout driver. Runs after CleanupBeforeInstall (stale
+; driver already stopped/deleted) and before the UI launch. The script
+; verifies BFE is running and throws on failure, so installer aborts with
+; a visible error rather than silently shipping a half-configured backend.
+; Skipped when the driver wasn't built (see WfpDriverStaged below) to match
+; the skipifsourcedoesntexist flags in [Files].
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\driver\DriverInstall.ps1"" -Install"; StatusMsg: "Installing VpnWfpCallout driver ..."; Flags: waituntilterminated runhidden; Check: WfpDriverStaged
+
 ; shellexec is required because the UI exe is marked requireAdministrator in
 ; its manifest. CreateProcess from the installer fails with ERROR_ELEVATION_
 ; REQUIRED (740); ShellExecute triggers the UAC prompt the way Explorer would.
@@ -107,6 +115,14 @@ begin
   // we skip the bundled MSI install entirely.
   Result := FileExists(ExpandConstant('{commonpf}\OpenVPN\bin\openvpn.exe'))
          or FileExists(ExpandConstant('{commonpf32}\OpenVPN\bin\openvpn.exe'));
+end;
+
+function WfpDriverStaged: Boolean;
+begin
+  // The WFP driver is staged with skipifsourcedoesntexist in [Files] — when
+  // VpnWfpCallout.sys/inf weren't built, [Files] silently skips them and the
+  // post-install step must skip too instead of failing on a missing INF.
+  Result := FileExists(ExpandConstant('{app}\driver\VpnWfpCallout.inf'));
 end;
 
 procedure CleanupBeforeInstall;

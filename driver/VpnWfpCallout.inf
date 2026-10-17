@@ -25,40 +25,21 @@ VpnWfpCallout.sys=1,,
 DefaultDestDir=12 ; %WinDir%\System32\Drivers
 VpnWfpCallout.DriverFiles=12
 
-[DefaultInstall.ntx86]
-OptionDesc=%VpnWfpCalloutServiceDesc%
-CopyFiles=VpnWfpCallout.DriverFiles
-
+; x64-only: build.ps1 compiles /p:Platform=x64 and installer targets
+; ArchitecturesAllowed=x64compatible, so no .ntx86 / .ntarm64 sections.
+; DriverInstall.ps1 invokes DefaultInstall 132, which resolves to
+; DefaultInstall.ntamd64 on x64.
 [DefaultInstall.ntamd64]
 OptionDesc=%VpnWfpCalloutServiceDesc%
 CopyFiles=VpnWfpCallout.DriverFiles
 
-[DefaultInstall.ntarm64]
-OptionDesc=%VpnWfpCalloutServiceDesc%
-CopyFiles=VpnWfpCallout.DriverFiles
-
-[DefaultInstall.ntx86.Services]
-AddService=%VpnWfpCalloutServiceName%,0x00000800,VpnWfpCallout.Service
-[DefaultUninstall.ntx86]
-LegacyUninstall=1
-[DefaultUninstall.ntx86.Services]
-LegacyUninstall=1
-DelService=%VpnWfpCalloutServiceName%,0x200
-
 [DefaultInstall.ntamd64.Services]
 AddService=%VpnWfpCalloutServiceName%,0x00000800,VpnWfpCallout.Service
+
 [DefaultUninstall.ntamd64]
 LegacyUninstall=1
-[DefaultUninstall.ntamd64.Services]
-LegacyUninstall=1
-DelService=%VpnWfpCalloutServiceName%,0x200
 
-[DefaultInstall.ntarm64.Services]
-AddService=%VpnWfpCalloutServiceName%,0x00000800,VpnWfpCallout.Service
-[DefaultUninstall.ntarm64]
-LegacyUninstall=1
-[DefaultUninstall.ntarm64.Services]
-LegacyUninstall=1
+[DefaultUninstall.ntamd64.Services]
 DelService=%VpnWfpCalloutServiceName%,0x200
 
 [VpnWfpCallout.DriverFiles]

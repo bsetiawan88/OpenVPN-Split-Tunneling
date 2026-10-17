@@ -486,7 +486,13 @@ VpnWfpClassifyDatagramV4(
         UINT32 remoteIp = inFixedValues->incomingValue[FWPS_FIELD_DATAGRAM_DATA_V4_IP_REMOTE_ADDRESS].value.uint32;
         UINT16 localPort = inFixedValues->incomingValue[FWPS_FIELD_DATAGRAM_DATA_V4_IP_LOCAL_PORT].value.uint16;
         if ((remoteIp & 0xFF) == 0x7F) { classifyOut->actionType = FWP_ACTION_CONTINUE; return; }
-        VpnWfpFlowInsert(localPort ? localPort : (UINT16)(flowContext & 0xFFFF), IPPROTO_UDP, remoteIp, remotePort, pid);
+        // Only record a trustworthy key. This layer has no valid flowContext
+        // (association happens at the REDIRECT layer for connected UDP, and
+        // this datagram filter has none of its own), so the old
+        // `localPort ? localPort : flowContext & 0xFFFF` fallback could
+        // insert a port-0/garbage entry. FlowInsert is diagnostics-only
+        // (QUERY path); skipping it never changes the BLOCK decision.
+        if (localPort) VpnWfpFlowInsert(localPort, IPPROTO_UDP, remoteIp, remotePort, pid);
     }
     UNREFERENCED_PARAMETER(layerData);
     classifyOut->actionType = FWP_ACTION_BLOCK;

@@ -25,6 +25,9 @@ use ipc::status::EventKind;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_BUF: usize = 65536;
+/// Rate-limit for repeated "no original-dst" failures on the same app src,
+/// so a chatty datagram loop cannot flood the log/UI bus. Windows: once.
+const UDP_WARN_THROTTLE: Duration = Duration::from_secs(5);
 
 fn short(s: &str) -> String {
     const MAX: usize = 180;
@@ -289,10 +292,12 @@ async fn udp_loop(
     resolver: Arc<Resolver>,
 ) -> Result<()> {
     let mut nat: HashMap<SocketAddr, UdpNatEntry> = HashMap::new();
+    let mut warn_at: HashMap<SocketAddr, Instant> = HashMap::new();
     let mut buf = vec![0u8; UDP_BUF];
     loop {
         let now = Instant::now();
         nat.retain(|_, e| now.duration_since(e.last_active) < UDP_IDLE_TIMEOUT);
+        warn_at.retain(|_, t| now.duration_since(*t) < UDP_IDLE_TIMEOUT);
         let (n, src) = listener.recv_from(&mut buf).await?;
         let payload = buf[..n].to_vec();
         let app_src_port = match src {
@@ -309,12 +314,26 @@ async fn udp_loop(
                 (SocketAddr::V4(SocketAddrV4::new(ip, r.dst_port_host)), r.pid)
             }
             Err(e) => {
-                if !nat.contains_key(&src) {
+                // Loud for BOTH cases (must not silently blackhole): when a
+                // stale NAT entry exists the driver flow was lost (VPN
+                // rotate / FLUSH_FLOWS / table eviction) and datagrams are
+                // being vanishing with zero forensics. Never route via the
+                // stale entry — an unconnected app may reuse the same src
+                // port for a different dst.
+                let throttled = matches!(warn_at.get(&src), Some(t) if now.duration_since(*t) < UDP_WARN_THROTTLE);
+                if !throttled {
+                    warn_at.insert(src, now);
+                    let stale = if nat.contains_key(&src) {
+                        " — stale NAT entry retained, will resume once the app reconnects its UDP socket or the entry evicts"
+                    } else {
+                        ""
+                    };
                     let detail = format!(
-                        "wfp udp: no original-dst for app src {} ({} bytes) ({}) — dropping; use connected UDP or ensure driver DATAGRAM mapping",
+                        "wfp udp: no original-dst for app src {} ({} bytes) ({}){} — dropping; use connected UDP or ensure driver DATAGRAM mapping",
                         src,
                         n,
-                        short(&e.to_string())
+                        short(&e.to_string()),
+                        stale
                     );
                     tracing::warn!("{}", detail);
                     bus.emit(EventKind::BridgeFailed, short(&detail));
