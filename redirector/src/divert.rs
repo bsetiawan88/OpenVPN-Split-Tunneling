@@ -1347,7 +1347,7 @@ async fn tcp_bridge(
     // else → existing blind bridge with the peeked bytes forwarded first.
     // Bounded wait: a quiet keep-alive must not stall the bridge (the first
     // data usually arrives within ms — the pump queued it pre-spawn).
-    let mut first: Vec<u8> = match tokio::time::timeout(
+    let first: Vec<u8> = match tokio::time::timeout(
         crate::mitm::first_chunk_timeout(),
         from_app.recv(),
     )

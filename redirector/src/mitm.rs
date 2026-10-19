@@ -26,7 +26,6 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 
-use rustls::crypto::KeyProvider as _;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
