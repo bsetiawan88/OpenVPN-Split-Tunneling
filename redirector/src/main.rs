@@ -3,6 +3,7 @@ mod divert;
 mod forward_table;
 mod flows;
 mod http_log;
+mod mitm;
 mod nic_stats;
 mod observer;
 mod pidlookup;

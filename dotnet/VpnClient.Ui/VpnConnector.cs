@@ -916,6 +916,137 @@ public class VpnConnector
         catch { }
     }
 
+    /// <summary>MITM master sentinel watched by the redirector.</summary>
+    public static string MitmFlagPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "VpnClient", "mitm.flag");
+
+    /// <summary>MITM per-app allowlist (one exe path per line).</summary>
+    public static string MitmAppsPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "VpnClient", "mitm-apps.txt");
+
+    /// <summary>Local MITM CA dir (must match redirector/src/mitm.rs).</summary>
+    public static string CaDir => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "VpnClient", "ca");
+
+    public static string CaCrtPath => Path.Combine(CaDir, "ca.crt");
+
+    /// <summary>Must match MITM_CA_CN in redirector/src/mitm.rs.</summary>
+    public const string MitmCaCommonName = "VpnClient Local MITM CA";
+
+    /// <summary>Sync MITM master switch to flag file. Never throws.</summary>
+    public static void SetMitmEnabled(bool enabled)
+    {
+        try
+        {
+            if (enabled)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(MitmFlagPath)!);
+                File.WriteAllText(MitmFlagPath, "on");
+            }
+            else if (File.Exists(MitmFlagPath))
+            {
+                File.Delete(MitmFlagPath);
+            }
+        }
+        catch { }
+    }
+
+    /// <summary>Mirror the allowlist for the redirector. Never throws.</summary>
+    public static void WriteMitmApps(IEnumerable<string> exePaths)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(MitmAppsPath)!);
+            File.WriteAllLines(MitmAppsPath, exePaths.Where(p => !string.IsNullOrWhiteSpace(p)));
+        }
+        catch { }
+    }
+
+    /// <summary>Install the redirector-generated CA into Trusted Root via
+    /// certutil (UI runs elevated, so the store write succeeds). Returns a
+    /// human-readable result for the status line. Never throws.</summary>
+    public static string InstallMitmCa()
+    {
+        try
+        {
+            if (!File.Exists(CaCrtPath))
+                return "CA not generated yet — enable MITM and generate traffic once, then retry.";
+            var psi = new ProcessStartInfo
+            {
+                FileName = "certutil.exe",
+                Arguments = $"-addstore Root \"{CaCrtPath}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            using var proc = Process.Start(psi);
+            if (proc is null) return "Cannot start certutil.exe.";
+            var stdout = proc.StandardOutput.ReadToEnd();
+            var stderr = proc.StandardError.ReadToEnd();
+            proc.WaitForExit(15000);
+            if (proc.ExitCode != 0)
+                return $"Install failed (exit {proc.ExitCode}): {(stderr + stdout).Trim()}";
+            // Remember the thumbprint for later removal.
+            var m = System.Text.RegularExpressions.Regex.Match(
+                stdout, @"Cert Hash\(sha1\):\s*([0-9a-fA-F ]+)");
+            if (m.Success)
+            {
+                try { File.WriteAllText(Path.Combine(CaDir, "thumbprint.txt"), m.Groups[1].Value.Replace(" ", "")); }
+                catch { }
+            }
+            return "CA installed to Trusted Root — opted apps' HTTPS will decrypt.";
+        }
+        catch (Exception ex)
+        {
+            return $"Install failed: {ex.Message}";
+        }
+    }
+
+    /// <summary>Remove the CA from Trusted Root by stored thumbprint.</summary>
+    public static string RemoveMitmCa()
+    {
+        try
+        {
+            var tpPath = Path.Combine(CaDir, "thumbprint.txt");
+            if (!File.Exists(tpPath))
+                return "No install record — remove manually: certmgr.msc → Trusted Root → \"" + MitmCaCommonName + "\".";
+            var thumb = File.ReadAllText(tpPath).Trim();
+            if (string.IsNullOrEmpty(thumb)) return "Empty install record — remove manually via certmgr.msc.";
+            var psi = new ProcessStartInfo
+            {
+                FileName = "certutil.exe",
+                Arguments = $"-delstore Root {thumb}",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            using var proc = Process.Start(psi);
+            if (proc is null) return "Cannot start certutil.exe.";
+            proc.StandardOutput.ReadToEnd();
+            var err = proc.StandardError.ReadToEnd();
+            proc.WaitForExit(15000);
+            try { File.Delete(tpPath); } catch { }
+            return proc.ExitCode == 0 ? "CA removed from Trusted Root." : $"Remove exited {proc.ExitCode}: {err.Trim()}";
+        }
+        catch (Exception ex)
+        {
+            return $"Remove failed: {ex.Message}";
+        }
+    }
+
+    public static string MitmCaStatus()
+    {
+        var crt = File.Exists(CaCrtPath);
+        var installed = File.Exists(Path.Combine(CaDir, "thumbprint.txt"));
+        if (!crt) return "CA: not generated yet (enable MITM, generate traffic once)";
+        return installed ? "CA: installed in Trusted Root" : "CA: generated, trust NOT installed (HTTPS will error until installed)";
+    }
+
     /// <summary>
     /// Fresh logs per app start: deletes stale activity.log + openvpn.log so
     /// a saved file always belongs to exactly one session. Called once from

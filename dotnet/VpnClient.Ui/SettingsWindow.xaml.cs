@@ -17,9 +17,46 @@ public partial class SettingsWindow : FluentWindow
     {
         InitializeComponent();
         _cfg = cfg;
+        var mitm = new System.Collections.Generic.HashSet<string>(
+            cfg.MitmApps, System.StringComparer.OrdinalIgnoreCase);
+        foreach (var a in cfg.TunneledApps) a.MitmDecrypt = mitm.Contains(a.ExePath);
         Apps = new ObservableCollection<AppEntry>(cfg.TunneledApps);
         AppList.ItemsSource = Apps;
+        MitmMasterCheck.IsChecked = cfg.MitmEnabled;
+        // Repair sentinel files if they were deleted manually.
+        VpnConnector.SetMitmEnabled(cfg.MitmEnabled);
+        VpnConnector.WriteMitmApps(cfg.MitmApps);
+        RefreshCaStatus();
     }
+
+    private void MitmMaster_Changed(object sender, RoutedEventArgs e)
+    {
+        _cfg.MitmEnabled = MitmMasterCheck.IsChecked == true;
+        _cfg.Save();
+        VpnConnector.SetMitmEnabled(_cfg.MitmEnabled);
+        ConfigChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void MitmCheck_Changed(object sender, RoutedEventArgs e)
+    {
+        if (sender is not System.Windows.Controls.CheckBox cb || cb.Tag is not string id) return;
+        var entry = Apps.FirstOrDefault(a => a.Id == id);
+        if (entry is null) return;
+        entry.MitmDecrypt = cb.IsChecked == true;
+        Persist();
+    }
+
+    private void InstallCaBtn_Click(object sender, RoutedEventArgs e)
+    {
+        CaStatusText.Text = VpnConnector.InstallMitmCa();
+    }
+
+    private void RemoveCaBtn_Click(object sender, RoutedEventArgs e)
+    {
+        CaStatusText.Text = VpnConnector.RemoveMitmCa();
+    }
+
+    private void RefreshCaStatus() => CaStatusText.Text = VpnConnector.MitmCaStatus();
 
     private void AddAppBtn_Click(object sender, RoutedEventArgs e)
     {
@@ -57,7 +94,10 @@ public partial class SettingsWindow : FluentWindow
     private void Persist()
     {
         _cfg.TunneledApps = Apps.ToList();
+        _cfg.MitmApps = Apps.Where(a => a.MitmDecrypt).Select(a => a.ExePath).ToList();
         _cfg.Save();
+        VpnConnector.WriteMitmApps(_cfg.MitmApps);
+        RefreshCaStatus();
         ConfigChanged?.Invoke(this, EventArgs.Empty);
     }
 }

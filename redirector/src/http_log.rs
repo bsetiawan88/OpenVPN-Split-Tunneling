@@ -251,8 +251,66 @@ pub fn try_parse_sni(buf: &[u8]) -> Option<String> {
     None
 }
 
-fn append_line(line: &str) {
-    use std::io::Write;
+/// Decrypted HTTPS request (MITM): full request line + header size. Bodies are
+/// never logged by design. One line per connection (first header block).
+pub fn log_mitm_request(
+    pid: u32,
+    exe: &str,
+    dst: &std::net::SocketAddr,
+    sni: &str,
+    method: &str,
+    host: &str,
+    target: &str,
+    header_bytes: usize,
+) {
+    let dest = if target.starts_with("http://") || target.starts_with("https://") {
+        target.to_string()
+    } else {
+        format!("{}{}", host, target)
+    };
+    append_line(&format!(
+        "HTTPS-decrypted {} \"{}\" (pid {}) -> {} SNI={} via {} [{}B headers]",
+        method, dest, pid, dst, sni, exe, header_bytes
+    ));
+}
+
+/// Decrypted TLS that is not HTTP (custom protocols, e.g. mtalk). Logs the
+/// first printable line or a byte count so the user can tell decrypt worked
+/// but there was no HTTP to show.
+pub fn log_mitm_opaque(pid: u32, exe: &str, dst: &std::net::SocketAddr, sni: &str, data: &[u8]) {
+    let preview: String = data
+        .iter()
+        .take(96)
+        .map(|&b| {
+            if b.is_ascii_graphic() || b == b' ' {
+                b as char
+            } else if b == b'\r' || b == b'\n' {
+                ' '
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    append_line(&format!(
+        "HTTPS-decrypted (non-HTTP, {}B) \"{}\" (pid {}) -> {} SNI={} via {}",
+        data.len(),
+        preview.trim(),
+        pid,
+        dst,
+        sni,
+        exe
+    ));
+}
+
+/// App handshook then sent nothing (racing/probe socket).
+pub fn log_mitm_empty(pid: u32, exe: &str, dst: &std::net::SocketAddr, sni: &str) {
+    append_line(&format!(
+        "HTTPS-decrypted (empty) (pid {}) -> {} SNI={} via {}",
+        pid, dst, sni, exe
+    ));
+}
+
+fn append_line(line: &str) {    use std::io::Write;
     let Some(path) = http_log_path() else {
         return;
     };

@@ -19,3 +19,7 @@ smoltcp = { version = "0.13", default-features = false, features = ["std", "prot
 sysinfo = "0.32"
 serde_json = "1.0.149"
 dashmap = "6.1.0"
+rustls.workspace = true
+tokio-rustls.workspace = true
+rcgen.workspace = true
+webpki-roots.workspace = true

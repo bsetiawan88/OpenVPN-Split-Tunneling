@@ -22,6 +22,14 @@ public class Config
     /// ON creates %AppData%\VpnClient\http-log.flag which the redirector watches.</summary>
     public bool HttpLogEnabled { get; set; } = false;
 
+    /// <summary>Master switch for TLS MITM decrypt-to-log. ON creates
+    /// %AppData%\VpnClient\mitm.flag. Per-app allowlist lives in MitmApps.</summary>
+    public bool MitmEnabled { get; set; } = false;
+
+    /// <summary>Exe paths opted into MITM decrypt (matched by file name,
+    /// like policy identity). Mirrored to mitm-apps.txt for the redirector.</summary>
+    public List<string> MitmApps { get; set; } = new();
+
     [JsonIgnore]
     public static string AppDataDir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VpnClient");
@@ -165,4 +173,9 @@ public class AppEntry
     public string DisplayName { get; set; } = "";
     public string ExePath { get; set; } = "";
     public DateTime AddedAt { get; set; } = DateTime.UtcNow;
+
+    /// <summary>UI-only: opted into MITM decrypt. Persisted via
+    /// <see cref="Config.MitmApps"/>, never serialized on the entry itself.</summary>
+    [JsonIgnore]
+    public bool MitmDecrypt { get; set; } = false;
 }

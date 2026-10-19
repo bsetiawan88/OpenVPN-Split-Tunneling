@@ -223,6 +223,24 @@ supervisor/              (Reserved; future service-mode redirector wrapper.)
 
 ---
 
+## Request logging (HTTP log + opt-in MITM)
+
+- **HTTP log** (footer checkbox): passive, no decrypt. Plain HTTP logs
+  `METHOD host/path`; HTTPS logs `SNI` only. File-only
+  `%LocalAppData%\VpnClient\runtime\http.log`, cleared on every app start.
+- **Decrypt HTTPS (MITM)**: opt-in per app in **Manage → Tunneled Apps**.
+  The redirector generates a local CA (`%AppData%\VpnClient\ca\ca.crt`),
+  terminates opted apps' TLS with per-SNI leaves, logs the decrypted
+  request line + headers (never bodies) to the same `http.log`, and
+  re-encrypts toward the server over the VPN. Steps: tick the master
+  switch, tick Decrypt on the app, hit **Install CA** (adds it to Trusted
+  Root — required, otherwise the app errors), generate traffic.
+  Non-HTTP TLS (custom protocols) logs as `(non-HTTP)`. Apps with
+  certificate pinning fail while opted in — untick Decrypt for them.
+  Remove trust anytime via **Remove CA** (or `certmgr.msc`).
+
+---
+
 ## License
 
 The Rust and C# code in this repository is released under the MIT license

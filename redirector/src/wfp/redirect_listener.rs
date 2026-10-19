@@ -245,33 +245,62 @@ pub async fn tcp_relay(
             .map_err(|_| anyhow::anyhow!("wfp relay connect({}) timed out", dst))?
             .with_context(|| format!("wfp relay connect({})", dst))?,
     };
-    let (mut ri, mut wi) = inbound.into_split();
-    let (mut ro, mut wo) = outbound.into_split();
+    let mut inbound = inbound;
+    let mut first = vec![0u8; 8192];
     // Passive HTTP log: peek the first client→server chunk before the
     // blind copy starts. Timeout-bounded so a quiet keep-alive never stalls
     // the relay; best-effort — logging must never break the bridge.
+    // MITM gate runs on the same peek: eligible + crypto ready → decrypt
+    // relay (moves both streams); otherwise fall through to blind copy with
+    // the peeked bytes forwarded first (byte-exact).
     {
-        let mut first = vec![0u8; 8192];
-        // Readable without consuming the stream twice: read once, forward
-        // the bytes, then continue with the regular copy.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        match tokio::time::timeout(std::time::Duration::from_secs(5), ri.read(&mut first)).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), inbound.read(&mut first)).await {
             Ok(Ok(n)) if n > 0 => {
-                crate::http_log::maybe_log(pid, exe, &dst, &first[..n]);
-                if wo.write_all(&first[..n]).await.is_err() {
+                let chunk = first[..n].to_vec();
+                crate::http_log::maybe_log(pid, exe, &dst, &chunk);
+                if let Some(sni) = crate::mitm::eligible(exe, &chunk) {
+                    if crate::mitm::crypto_ready(&sni) {
+                        tracing::info!("mitm: decrypting pid={} {} SNI={} (wfp)", pid, exe, sni);
+                        match crate::mitm::try_mitm_wfp(inbound, outbound, chunk, pid, exe, dst, &sni).await {
+                            Ok(()) => return Ok(0),
+                            Err(e) => {
+                                tracing::warn!("mitm pid={} {} failed, closing: {}", pid, exe, e);
+                                return Ok(0);
+                            }
+                        }
+                    }
+                }
+                let mut outbound = outbound;
+                if outbound.write_all(&chunk).await.is_err() {
                     return Ok(n as u64);
                 }
+                let (mut ri, mut wi) = inbound.into_split();
+                let (mut ro, mut wo) = outbound.into_split();
+                return relay_blind(&mut ri, &mut wo, &mut ro, &mut wi, n as u64).await;
             }
-            // No first bytes (timeout / EOF / error): fall through to the
-            // plain bidirectional copy — nothing to log.
+            // No first bytes (timeout / EOF / error): plain blind copy.
             _ => {}
         }
     }
-    let c2s = tokio::io::copy(&mut ri, &mut wo);
-    let s2c = tokio::io::copy(&mut ro, &mut wi);
+    let (mut ri, mut wi) = inbound.into_split();
+    let (mut ro, mut wo) = outbound.into_split();
+    relay_blind(&mut ri, &mut wo, &mut ro, &mut wi, 0).await
+}
+
+/// Blind bidirectional copy shared by the peeked and no-peek paths.
+async fn relay_blind(
+    ri: &mut tokio::net::tcp::OwnedReadHalf,
+    wo: &mut tokio::net::tcp::OwnedWriteHalf,
+    ro: &mut tokio::net::tcp::OwnedReadHalf,
+    wi: &mut tokio::net::tcp::OwnedWriteHalf,
+    already_up: u64,
+) -> Result<u64> {
+    let c2s = tokio::io::copy(ri, wo);
+    let s2c = tokio::io::copy(ro, wi);
     let (up, down) = tokio::join!(c2s, s2c);
     match (up, down) {
-        (Ok(u), Ok(d)) => Ok(u + d),
+        (Ok(u), Ok(d)) => Ok(u + d + already_up),
         (Err(e), _) => Err(e.into()),
         (_, Err(e)) => Err(e.into()),
     }

@@ -1029,7 +1029,7 @@ fn service_tcp_flows(
                         let fail_exe = flow.exe.clone();
                         let fail_pid = flow.pid;
                         tokio_handle.spawn(async move {
-                            if let Err(e) = tcp_bridge(dst, vpn_target, a2r_rx, r2a_tx).await {
+                            if let Err(e) = tcp_bridge(dst, vpn_target, a2r_rx, r2a_tx, fail_pid, fail_exe.clone()).await {
                                 let detail =
                                     format!("TCP \"{}\" (pid {}) to {} failed: {}", fail_exe, fail_pid, dst, short(&e.to_string()));
                                 tracing::warn!("{}", detail);
@@ -1304,6 +1304,8 @@ async fn tcp_bridge(
     target: Option<VpnTarget>,
     mut from_app: mpsc::Receiver<Vec<u8>>,
     to_app: mpsc::Sender<Vec<u8>>,
+    pid: u32,
+    exe: String,
 ) -> Result<()> {
     // 5s connect cap (was 15s): app-side data is already queued by the time
     // this runs, so a longer cap only delays the failure. A dead/blackholed
@@ -1340,7 +1342,46 @@ async fn tcp_bridge(
             .with_context(|| format!("tcp connect({})", dst))?,
     };
     tracing::debug!("tcp bridge connected to {} (local={:?})", dst, stream.local_addr().ok());
+    // MITM gate: peek the first app chunk for a ClientHello BEFORE going
+    // blind. Eligible (flag + app listed + SNI) → decrypt relay; anything
+    // else → existing blind bridge with the peeked bytes forwarded first.
+    // Bounded wait: a quiet keep-alive must not stall the bridge (the first
+    // data usually arrives within ms — the pump queued it pre-spawn).
+    let mut first: Vec<u8> = match tokio::time::timeout(
+        crate::mitm::first_chunk_timeout(),
+        from_app.recv(),
+    )
+    .await
+    {
+        Ok(Some(chunk)) => chunk,
+        _ => Vec::new(),
+    };
+    // MITM gate (moves nothing on "no"): eligible = flag + app listed + SNI,
+    // crypto_ready = CA loadable + SNI usable. Only then do the channels move
+    // into the decrypt relay; otherwise the blind path stays byte-exact.
+    if !first.is_empty() {
+        if let Some(sni) = crate::mitm::eligible(&exe, &first) {
+            if crate::mitm::crypto_ready(&sni) {
+                tracing::info!("mitm: decrypting pid={} {} SNI={}", pid, exe, sni);
+                match crate::mitm::try_mitm_divert(from_app, to_app, first, stream, pid, &exe, dst, &sni).await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        tracing::warn!("mitm pid={} {} failed, closing: {}", pid, exe, e);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    // Blind path (unchanged semantics): `first` (maybe empty) goes out first
+    // so the server sees the exact byte stream, then plain copy both ways.
     let (mut rd, mut wr) = stream.into_split();
+    if !first.is_empty() {
+        if wr.write_all(&first).await.is_err() {
+            return Ok(());
+        }
+    }
 
     let write_task = tokio::spawn(async move {
         while let Some(data) = from_app.recv().await {

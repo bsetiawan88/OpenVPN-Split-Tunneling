@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
         Title="Tunneled Apps"
-        Height="540" Width="720"
+        Height="700" Width="720"
         WindowBackdropType="Mica"
         WindowCornerPreference="Round"
         ExtendsContentIntoTitleBar="True">
@@ -20,6 +20,7 @@
         <Grid Grid.Row="1" Margin="24,12,24,12">
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
             </Grid.RowDefinitions>
 
@@ -35,7 +36,34 @@
                               Text="Select the .exe — child processes are tunneled automatically" />
             </StackPanel>
 
-            <Border Grid.Row="1"
+            <!-- MITM decrypt-to-log: master switch + CA trust. Per-app opt-in
+                 lives on each row below. Bodies never logged; HTTPS without
+                 trust installed will error in the app until Install. -->
+            <Border Grid.Row="1" Margin="0,0,0,12"
+                    Background="{DynamicResource ControlFillColorDefaultBrush}"
+                    CornerRadius="8" Padding="16,12">
+                <StackPanel>
+                    <CheckBox x:Name="MitmMasterCheck"
+                              Content="Decrypt HTTPS for selected apps (MITM)"
+                              Checked="MitmMaster_Changed" Unchecked="MitmMaster_Changed"
+                              ToolTip="Terminates app TLS with a local CA to log decrypted request lines to http.log. Opt-in per app below." />
+                    <ui:TextBlock Margin="0,6,0,0" FontTypography="Caption"
+                                  Foreground="{DynamicResource TextFillColorSecondaryBrush}"
+                                  Text="Logs request line + headers only, never bodies. Apps with certificate pinning will fail while opted in." />
+                    <StackPanel Orientation="Horizontal" Margin="0,8,0,0" VerticalAlignment="Center">
+                        <ui:Button x:Name="InstallCaBtn" Content="Install CA"
+                                   Appearance="Secondary" Click="InstallCaBtn_Click"
+                                   ToolTip="Add the local MITM CA to Trusted Root (required before decrypt works)" />
+                        <ui:Button x:Name="RemoveCaBtn" Content="Remove CA" Margin="8,0,0,0"
+                                   Appearance="Secondary" Click="RemoveCaBtn_Click" />
+                        <ui:TextBlock x:Name="CaStatusText" Margin="12,0,0,0" VerticalAlignment="Center"
+                                      FontTypography="Caption"
+                                      Foreground="{DynamicResource TextFillColorSecondaryBrush}" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Grid.Row="2"
                     Background="{DynamicResource ControlFillColorDefaultBrush}"
                     CornerRadius="8"
                     Padding="0">
@@ -52,6 +80,7 @@
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
                                 </Grid.ColumnDefinitions>
                                 <StackPanel>
                                     <ui:TextBlock Text="{Binding DisplayName}" FontTypography="BodyStrong" />
@@ -60,7 +89,12 @@
                                                   FontTypography="Caption"
                                                   Margin="0,2,0,0" />
                                 </StackPanel>
-                                <ui:Button Grid.Column="1"
+                                <CheckBox Grid.Column="1" Content="Decrypt"
+                                          IsChecked="{Binding MitmDecrypt, Mode=TwoWay}"
+                                          Checked="MitmCheck_Changed" Unchecked="MitmCheck_Changed"
+                                          Tag="{Binding Id}" VerticalAlignment="Center" Margin="0,0,12,0"
+                                          ToolTip="Decrypt this app's HTTPS to http.log (needs CA installed above)" />
+                                <ui:Button Grid.Column="2"
                                            Content="Remove"
                                            Click="RemoveApp_Click"
                                            Tag="{Binding Id}" />
