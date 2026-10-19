@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -34,6 +34,38 @@ const SMOLTCP_CHUNK: usize = 16 * 1024;
 /// (win_shift derives from rx capacity) and carry ~40+ Mbps per flow.
 const SMOLTCP_BUF: usize = 256 * 1024;
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long an app-side TCP handshake may stay incomplete (SYN consumed,
+/// SYN-ACK sent, final ACK never seen) before the flow is retired. In
+/// practice this state lasts milliseconds; a multi-second soak means the app
+/// abandoned the socket while our SYN-ACK was in flight — Chrome opens
+/// racing connections and closes the losers, and a never-established socket
+/// closed by the app sends no RST, so nothing else would end this state.
+/// 5s (was 30s) frees the 4-tuple six times sooner: the app's next SYN
+/// retransmission then builds a FRESH listener → SYN-ACK → handshake
+/// completes — recovery instead of squatting. Counted in the 5s report as
+/// pending_timeout so a regression shows up without log spelunking.
+const PENDING_TCP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// WinDivert capture filter — NETWORK layer, outbound TCP/UDP. The DNS /
+/// mDNS / LLMNR ports are excluded so that name chatter never pays the
+/// userspace round-trip (see the NOTE in `run`).
+///
+/// GRAMMAR + SEMANTIC GOTCHAS (regression guards `capture_filter_compiles`
+/// and `capture_filter_semantics`):
+///
+///   1. WinDivert 2.2 accepts `not` / `!` **only** as a prefix on a single
+///      field (`!loopback`); `not (expr)` / `!(expr)` is a PARSE error, and a
+///      parse error makes `WinDivertOpen` fail with ERROR_INVALID_PARAMETER
+///      (87), aborting the backend. (A non-elevated run fails *earlier* with
+///      ERROR_ACCESS_DENIED, hiding this until the process is elevated.)
+///   2. A field of an ABSENT layer evaluates FALSE, not zero. On a UDP packet
+///      `tcp.DstPort != 53` is therefore false, so flattening the negation
+///      into `tcp.DstPort != 53 and udp.DstPort != 53` matches NOTHING (no
+///      packet is both TCP and UDP). The negated group must be split into
+///      per-protocol branches, each guarded by its own `tcp` / `udp` test.
+pub(crate) const CAPTURE_FILTER: &str = "outbound and ip and !loopback and \
+     ((tcp and tcp.DstPort != 53) \
+      or (udp and udp.DstPort != 53 and udp.DstPort != 5353 and udp.DstPort != 5355))";
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -47,15 +79,18 @@ pub fn run(
     // NOTE on "why can't untunneled traffic fully bypass us": WinDivert's
     // NETWORK layer carries no PID, so the filter cannot exclude apps —
     // every matching packet MUST visit userspace for a verdict. The tax is
-    // minimized instead: (a) this filter excludes ports that can never need
-    // tunneling (DNS + link-local name chatter) so they skip the queue trip
-    // entirely, (b) the divert loop batches + never blocks on verdicts, (c)
-    // divert.rs still early-returns port 53 as backstop.
-    let capture_filter = "outbound and ip and (tcp or udp) and !loopback \
-        and not (tcp.DstPort == 53 or udp.DstPort == 53 \
-        or udp.DstPort == 5353 or udp.DstPort == 5355)";
+    // minimized instead: (a) CAPTURE_FILTER excludes ports that can never
+    // need tunneling (DNS + link-local name chatter) so they skip the queue
+    // trip entirely, (b) the divert loop batches + never blocks on verdicts,
+    // (c) divert.rs still early-returns port 53 as backstop.
+    let capture_filter = CAPTURE_FILTER;
     let capture = WinDivert::network(capture_filter, 1040, WinDivertFlags::new())
-        .context("WinDivert::network capture handle failed (need admin)")?;
+        .with_context(|| {
+            format!(
+                "WinDivert::network capture handle failed (elevated shell + valid filter required; \
+                 filter={capture_filter})"
+            )
+        })?;
     // Deepen the driver queue (default 4096 packets / 4MB; max 16384 / 32MB):
     // under flood (speedtest = tens of thousands of pps) a shallow queue
     // drops before our loop drains it. Best-effort: a failure here must not
@@ -95,11 +130,12 @@ pub fn run(
     let mut tcp_flows: HashMap<TcpKey, TcpFlow> = HashMap::new();
     let mut udp_flows: HashMap<UdpKey, UdpFlow> = HashMap::new();
 
-    let stats = Arc::new(Stats::new(bus.clone()));
+    let stats = Arc::new(Stats::new(bus.clone(), resolver.clone()));
     let stats_clone = stats.clone();
     std::thread::spawn(move || stats_clone.report_loop());
 
-    let mut buffer = vec![0u8; 65535];
+    let mut buffer = vec![0u8; CAPTURE_BUF];
+    let mut admit_cache = AdmitCache::new();
     let mut last_vpn = vpn_state::current(&vpn_state);
     // Outer slot arrays are reused so the batch assembly doesn't grow; each
     // passthrough packet still gets its own owned Vec from into_owned(),
@@ -118,57 +154,42 @@ pub fn run(
             last_vpn = now_vpn;
         }
 
-        let recv_result = capture.recv_wait(&mut buffer, 50);
-        if let Ok(Some(packet)) = recv_result {
-            let decision = handle_capture(
-                packet,
-                &policy_state,
-                &flows,
-                &mut tcp_flows,
-                &mut udp_flows,
-                &mut sockets,
-                &mut device,
-                &tokio_handle,
-                now_vpn,
-                &stats,
-                &resolver,
-                &tunneled_paths,
-                &bus,
-            );
-            match decision {
-                Captured::Passthrough(data) => passthrough.push(data),
-                Captured::Consumed => {}
-            }
-            // Drain the queue in batches: one poll+service cycle per packet
-            // collapses under flood (service scans every flow per packet).
-            // Batching amortizes each cycle over up to CAPTURE_BATCH packets
-            // — this also unclogs UNTUNNELED traffic sharing the same queue.
-            for _ in 1..CAPTURE_BATCH {
-                match capture.recv_wait(&mut buffer, 0) {
-                    Ok(Some(packet)) => {
-                        match handle_capture(
-                            packet,
-                            &policy_state,
-                            &flows,
-                            &mut tcp_flows,
-                            &mut udp_flows,
-                            &mut sockets,
-                            &mut device,
-                            &tokio_handle,
-                            now_vpn,
-                            &stats,
-                            &resolver,
-                            &tunneled_paths,
-                            &bus,
-                        ) {
-                            Captured::Passthrough(data) => passthrough.push(data),
-                            Captured::Consumed => {}
-                        }
+        let t_recv = Instant::now();
+        // ONE overlapped RecvEx per iteration for up to RECV_BATCH packets.
+        // timeout_ms=50 blocks only when the queue is empty, and an expired
+        // wait surfaces as Ok(empty) — never an error — so idle iterations
+        // stay silent (no recv_err inflation). Packets beyond the batch are
+        // left in the driver queue for the next iteration; poll+service run
+        // once per batch regardless.
+        match capture.recv_wait_ex(&mut buffer, RECV_BATCH as u8, 50) {
+            Ok(packets) => {
+                for packet in packets {
+                    match handle_capture(
+                        packet,
+                        &policy_state,
+                        &flows,
+                        &mut admit_cache,
+                        &mut tcp_flows,
+                        &mut udp_flows,
+                        &mut sockets,
+                        &mut device,
+                        &tokio_handle,
+                        now_vpn,
+                        &stats,
+                        &resolver,
+                        &tunneled_paths,
+                        &bus,
+                    ) {
+                        Captured::Passthrough(data) => passthrough.push(data),
+                        Captured::Consumed => {}
                     }
-                    _ => break,
                 }
             }
+            Err(_) => {
+                stats.recv_err.fetch_add(1, Ordering::Relaxed);
+            }
         }
+        let t_flush = Instant::now();
 
         // One overlapped syscall for the whole batch instead of one per
         // packet: this is the dominant cost of untunneled traffic under
@@ -188,6 +209,9 @@ pub fn run(
                     data: Cow::Owned(data),
                 });
             }
+            stats
+                .pass_bytes
+                .fetch_add(expected_bytes as u64, Ordering::Relaxed);
             let count = send_batch.len();
             // send_ex returns TOTAL BYTES injected, not a packet count: a
             // short Ok(n) means the tail of the batch never hit the wire.
@@ -217,23 +241,51 @@ pub fn run(
             // poll()/service_* until the next flush.
             send_batch.clear();
         }
+        let t_svc = Instant::now();
 
-        let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
-        drain_tx(&mut device, &inject, &stats);
+        // Fast path: with no bridges and no sockets there is no smoltcp work
+        // to do — poll() would walk an empty socket set, the service
+        // scanners would walk empty maps, and the virtual-device queues can
+        // only be filled by those same poll()/capture paths. Pure-passthrough
+        // traffic (a speedtest, idle untunneled apps) therefore skips the
+        // whole block; the phase timer still accounts for the (zero) cost.
+        let have_bridges =
+            !tcp_flows.is_empty() || !udp_flows.is_empty() || sockets.iter().next().is_some();
+        if have_bridges {
+            let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
+            drain_tx(&mut device, &inject, &stats);
 
-        service_tcp_flows(
-            &mut tcp_flows,
-            &mut sockets,
-            &tokio_handle,
-            now_vpn,
-            &stats,
-            &bus,
-            &mut pump_scratch,
+            service_tcp_flows(
+                &mut tcp_flows,
+                &mut sockets,
+                &tokio_handle,
+                now_vpn,
+                &stats,
+                &bus,
+                &mut pump_scratch,
+            );
+            service_udp_flows(&mut udp_flows, &inject, &stats);
+
+            let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
+            drain_tx(&mut device, &inject, &stats);
+        }
+
+        // Where does each iteration actually go? Logged every 5s so a
+        // throughput ceiling can be attributed to a phase instead of guessed.
+        // us_recv includes the 50ms idle wait, so a large value means "idle".
+        stats.loops.fetch_add(1, Ordering::Relaxed);
+        stats.us_recv.fetch_add(
+            t_flush.duration_since(t_recv).as_micros() as u64,
+            Ordering::Relaxed,
         );
-        service_udp_flows(&mut udp_flows, &inject, &stats);
-
-        let _ = iface.poll(smoltcp::time::Instant::now(), &mut device, &mut sockets);
-        drain_tx(&mut device, &inject, &stats);
+        stats.us_flush.fetch_add(
+            t_svc.duration_since(t_flush).as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        stats.us_svc.fetch_add(
+            Instant::now().duration_since(t_svc).as_micros() as u64,
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -296,6 +348,21 @@ const MTU_PAYLOAD: usize = 1500;
 /// Packets handled per loop iteration (poll+service amortized across them).
 /// 64 keeps per-iteration work bounded while draining floods.
 const CAPTURE_BATCH: usize = 64;
+/// Packets per batched WinDivertRecvEx — the single recv syscall shape of the
+/// loop: ONE call per iteration that waits up to 50 ms only when the queue is
+/// empty and returns Ok(empty) on timeout (no error). The old shape paid the
+/// outer wait per iteration PLUS up to 4 timeout=0 drain rounds, each with
+/// its own WaitForSingleObject/CancelIo pair.
+const RECV_BATCH: usize = 32;
+/// Capture buffer sized for RECV_BATCH full-MTU frames (32 x 8 KiB): the
+/// driver fills as many packets as fit, so undersizing silently caps the
+/// batch instead of failing.
+const CAPTURE_BUF: usize = RECV_BATCH * 8 * 1024;
+/// How long a failed PID resolution suppresses further attempts for the same
+/// local endpoint. Short enough that a flow which becomes resolvable is picked
+/// up quickly; long enough that a bulk flow which can never be resolved does
+/// not pay the ~1 ms wait on every packet.
+const PID_NEG_TTL: Duration = Duration::from_millis(250);
 
 /// Keyed on the FULL 4-tuple: without dst, an ephemeral port reused for a
 /// different destination collides with the old flow and gets RST'd.
@@ -412,22 +479,54 @@ fn resolve_pid_with_retry(
     flows: &FlowTable,
     src_ip: Ipv4Addr,
     src_port: u16,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
     proto: u8,
+    stats: &Stats,
 ) -> Option<u32> {
+    // TCP rows carry the full 4-tuple, so hand the destination over for an
+    // exact match. UDP rows have no remote to match on.
+    let remote = if proto == PROTO_TCP {
+        Some((dst_ip, dst_port))
+    } else {
+        None
+    };
     let lookup = |flows: &FlowTable| -> Option<u32> {
         flows::lookup_with_wildcard(flows, IpAddr::V4(src_ip), src_port, proto)
             .map(|e| e.pid)
-            .or_else(|| pidlookup::pid_for_local_v4(src_ip, src_port, proto))
+            .or_else(|| pidlookup::pid_for_local_v4(src_ip, src_port, proto, remote))
     };
 
     if let Some(p) = lookup(flows) {
         return Some(p);
     }
+    // A flow that just failed is not retried for PID_NEG_TTL. Without this a
+    // bulk flow whose owner can never be resolved (kernel-generated, or racing
+    // the socket table) pays the ~1 ms wait on EVERY packet, which caps the
+    // whole single-threaded loop.
+    let neg_key = (proto, src_port, u32::from(src_ip));
+    if let Ok(neg) = stats.neg_pid.lock() {
+        if let Some(at) = neg.get(&neg_key) {
+            if at.elapsed() < PID_NEG_TTL {
+                return None;
+            }
+        }
+    }
+    // Missed both the observer flow table and the live IPHLPAPI tables: this
+    // packet is about to sleep up to 5 x 200 us. Counted so the 5s report can
+    // prove (or kill) the "PID stalls cap the loop" theory.
+    stats.pid_stalls.fetch_add(1, Ordering::Relaxed);
     for _ in 0..5 {
         std::thread::sleep(Duration::from_micros(200));
         if let Some(p) = lookup(flows) {
             return Some(p);
         }
+    }
+    if let Ok(mut neg) = stats.neg_pid.lock() {
+        if neg.len() >= 4096 {
+            neg.retain(|_, at| at.elapsed() < PID_NEG_TTL);
+        }
+        neg.insert(neg_key, Instant::now());
     }
     None
 }
@@ -463,6 +562,122 @@ fn policy_admit(
     }
 }
 
+/// How long a per-PID admission verdict is trusted on the per-packet path.
+/// Membership flips only on a UI toggle (policy add/remove) or process
+/// lifecycle, so 2s bounds the staleness to something the user never
+/// perceives — new flows are exempt entirely (they always re-evaluate).
+const ADMIT_TTL: Duration = Duration::from_secs(2);
+const ADMIT_CACHE_MAX: usize = 4096;
+
+/// PID → admission verdict, TTL-bounded. Why it exists: for a NON-tunneled
+/// process (firefox under split), every pass-through packet re-ran
+/// resolve() + `tunneled::matches` (which lowercases the candidate path —
+/// two String allocations per packet!) + parent_of(). At speedtest rates
+/// that was the dominant remaining cost of the passthrough hot path (the
+/// divert-5s timers showed it). The verdict can only change via UI toggle
+/// or PID lifecycle; both are covered by the short TTL plus the
+/// is_new_flow re-evaluation.
+struct AdmitCache {
+    map: HashMap<u32, (bool, Instant)>,
+}
+
+impl AdmitCache {
+    fn new() -> Self {
+        Self { map: HashMap::new() }
+    }
+
+    /// Fresh verdict only; `None` forces full evaluation.
+    fn get(&self, pid: u32) -> Option<bool> {
+        self.map
+            .get(&pid)
+            .and_then(|(verdict, at)| (at.elapsed() < ADMIT_TTL).then_some(*verdict))
+    }
+
+    fn put(&mut self, pid: u32, verdict: bool) {
+        if self.map.len() >= ADMIT_CACHE_MAX {
+            let now = Instant::now();
+            self.map
+                .retain(|_, (_, at)| now.duration_since(*at) < ADMIT_TTL);
+        }
+        self.map.insert(pid, (verdict, Instant::now()));
+    }
+}
+
+/// The full admission chain for one PID (steps 1-4 above). Runs on every
+/// verdict-cache miss and for every NEW flow — where it also performs the
+/// auto-tunnel side effects (policy::add + status events). Lives behind
+/// AdmitCache so repeat packets never pay its cost.
+fn evaluate_admission(
+    policy_state: &PolicyState,
+    resolver: &Arc<Resolver>,
+    tunneled_paths: &TunneledPaths,
+    bus: &Arc<StatusBus>,
+    p: u32,
+    is_new_flow: bool,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+) -> bool {
+    if policy_admit(policy_state, resolver, p, is_new_flow) {
+        return true;
+    }
+    if let Some(info) = resolver.resolve(p) {
+        if tunneled::matches(tunneled_paths, std::path::Path::new(&info.exe_path)) {
+            tracing::info!("auto-tunnel (packet): pid={} matches {}", p, info.exe_path);
+            bus.emit(
+                EventKind::AppAdmitted,
+                format!(
+                    "\"{}\" (pid {}) admitted — path match, connecting to {}:{}",
+                    info.exe_name, p, dst_ip, dst_port
+                ),
+            );
+            policy::add(policy_state, p, &info.exe_path);
+            bus.pid_paths.insert(p, info.exe_path);
+            true
+        } else if let Some(ppid) = resolver.parent_of(p) {
+            if policy_admit(policy_state, resolver, ppid, true) {
+                tracing::info!(
+                    "auto-tunnel (packet child): pid={} parent={} exe={}",
+                    p,
+                    ppid,
+                    info.exe_path
+                );
+                bus.emit(
+                    EventKind::AppAdmitted,
+                    format!(
+                        "\"{}\" (pid {}) admitted — child of pid {}, connecting to {}:{}",
+                        info.exe_name, p, ppid, dst_ip, dst_port
+                    ),
+                );
+                policy::add(policy_state, p, &info.exe_path);
+                bus.pid_paths.insert(p, info.exe_path);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        // No exe path (yet) — still check parent inheritance so short-lived
+        // children of tunneled parents don't escape.
+        match resolver.parent_of(p) {
+            Some(ppid) if policy_admit(policy_state, resolver, ppid, true) => {
+                tracing::info!("auto-tunnel (packet child, no exe): pid={} parent={}", p, ppid);
+                bus.emit(
+                    EventKind::AppAdmitted,
+                    format!(
+                        "pid {} admitted — child of pid {}, connecting to {}:{}",
+                        p, ppid, dst_ip, dst_port
+                    ),
+                );
+                policy::add_unvalidated(policy_state, p);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// What handle_capture decided about a captured packet.
 ///
 /// Passthrough packets are NOT sent here: they are handed back as owned
@@ -482,6 +697,7 @@ fn handle_capture(
     packet: WinDivertPacket<'_, NetworkLayer>,
     policy_state: &PolicyState,
     flows: &FlowTable,
+    admit_cache: &mut AdmitCache,
     tcp_flows: &mut HashMap<TcpKey, TcpFlow>,
     udp_flows: &mut HashMap<UdpKey, UdpFlow>,
     sockets: &mut SocketSet<'static>,
@@ -496,7 +712,7 @@ fn handle_capture(
     let parsed = match parse_ipv4_l4(&packet.data) {
         Some(p) => p,
         None => {
-            stats.passed.fetch_add(1, Ordering::Relaxed);
+            stats.pass_malformed.fetch_add(1, Ordering::Relaxed);
             return Captured::Passthrough(packet.data.into_owned());
         }
     };
@@ -529,11 +745,11 @@ fn handle_capture(
     // Bonus: skipping PID resolution + admission here keeps the hot path
     // short for the highest-rate flow class on the box.
     if dst_port == 53 || dst_port == 5353 || dst_port == 5355 {
-        stats.passed.fetch_add(1, Ordering::Relaxed);
+        stats.pass_dns.fetch_add(1, Ordering::Relaxed);
         return Captured::Passthrough(packet.data.into_owned());
     }
 
-    let pid = resolve_pid_with_retry(flows, src_ip, src_port, proto);
+    let pid = resolve_pid_with_retry(flows, src_ip, src_port, dst_ip, dst_port, proto, stats);
     if let Some(p) = pid {
         // Only take the write lock when the cached PID actually differs.
         // Merely testing presence would freeze a stale entry forever (the
@@ -556,77 +772,56 @@ fn handle_capture(
     //   4. otherwise → pass through to the default route
     //
     // Identity validation runs only for packets that would open a new flow
-    // (cheap hash pre-check): per-packet fresh-resolves would stall the
-    // loop, but new flows are rare enough for one OpenProcess each.
+    // (cheap hash pre-check): per-packet fresh-resolves would stall the loop,
+    // but new flows are rare enough for one OpenProcess each. Repeat packets
+    // are answered from AdmitCache (see there).
     let flow_key_exists = if is_tcp {
         tcp_flows.contains_key(&TcpKey { src_ip, src_port, dst_ip, dst_port })
     } else {
         udp_flows.contains_key(&UdpKey { src_ip, src_port, dst_ip, dst_port })
     };
     let is_new_flow = !flow_key_exists;
+    // Verdict shape: a NEW flow always walks the full chain (identity
+    // revalidation + auto-tunnel admission live there); repeat packets of an
+    // open flow are served from the TTL cache, so the per-packet path pays
+    // one hash lookup instead of resolve() + tunneled::matches() +
+    // parent_of() (see AdmitCache).
     let is_tunneled = match pid {
-        Some(p) if policy_admit(policy_state, resolver, p, is_new_flow) => true,
-        Some(p) => {
-            if let Some(info) = resolver.resolve(p) {
-                if tunneled::matches(tunneled_paths, std::path::Path::new(&info.exe_path)) {
-                    tracing::info!(
-                        "auto-tunnel (packet): pid={} matches {}",
-                        p, info.exe_path
-                    );
-                    bus.emit(
-                        EventKind::AppAdmitted,
-                        format!("\"{}\" (pid {}) admitted — path match, connecting to {}:{}", info.exe_name, p, dst_ip, dst_port),
-                    );
-                    policy::add(policy_state, p, &info.exe_path);
-                    bus.pid_paths.insert(p, info.exe_path);
-                    true
-                } else if let Some(ppid) = resolver.parent_of(p) {
-                    if policy_admit(policy_state, resolver, ppid, true) {
-                        tracing::info!(
-                            "auto-tunnel (packet child): pid={} parent={} exe={}",
-                            p, ppid, info.exe_path
-                        );
-                        bus.emit(
-                            EventKind::AppAdmitted,
-                            format!(
-                                "\"{}\" (pid {}) admitted — child of pid {}, connecting to {}:{}",
-                                info.exe_name, p, ppid, dst_ip, dst_port
-                            ),
-                        );
-                        policy::add(policy_state, p, &info.exe_path);
-                        bus.pid_paths.insert(p, info.exe_path);
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                // No exe path (yet) — still check parent inheritance so
-                // short-lived children of tunneled parents don't escape.
-                match resolver.parent_of(p) {
-                    Some(ppid) if policy_admit(policy_state, resolver, ppid, true) => {
-                        tracing::info!(
-                            "auto-tunnel (packet child, no exe): pid={} parent={}",
-                            p, ppid
-                        );
-                        bus.emit(
-                            EventKind::AppAdmitted,
-                            format!("pid {} admitted — child of pid {}, connecting to {}:{}", p, ppid, dst_ip, dst_port),
-                        );
-                        policy::add_unvalidated(policy_state, p);
-                        true
-                    }
-                    _ => false,
-                }
-            }
+        Some(p) if is_new_flow => {
+            let verdict = evaluate_admission(
+                policy_state, resolver, tunneled_paths, bus, p, true, dst_ip, dst_port,
+            );
+            admit_cache.put(p, verdict);
+            verdict
         }
+        Some(p) => match admit_cache.get(p) {
+            Some(verdict) => verdict,
+            None => {
+                let verdict = evaluate_admission(
+                    policy_state, resolver, tunneled_paths, bus, p, false, dst_ip, dst_port,
+                );
+                admit_cache.put(p, verdict);
+                verdict
+            }
+        },
         None => false,
     };
 
     if !is_tunneled {
-        stats.passed.fetch_add(1, Ordering::Relaxed);
+        // Opt-in packet trace: enable with RUST_LOG=pkt=debug. Deliberately a
+        // target outside `redirector` so the default `redirector=debug` filter
+        // does NOT turn on per-packet logging (that would flood the file).
+        tracing::debug!(
+            target: "pkt",
+            "untun pid={:?} {}/{} -> {}:{}",
+            pid,
+            if is_tcp { "tcp" } else { "udp" },
+            src_port,
+            dst_ip,
+            dst_port
+        );
+        stats.pass_untun.fetch_add(1, Ordering::Relaxed);
+        stats.note_untun(proto, dst_port, dst_ip, pid);
         return Captured::Passthrough(packet.data.into_owned());
     }
     let pid = pid.unwrap();
@@ -639,7 +834,7 @@ fn handle_capture(
     // will see a RST and reconnect — and that reconnect goes straight
     // through here.
     if vpn_target.is_none() {
-        stats.passed.fetch_add(1, Ordering::Relaxed);
+        stats.pass_vpn_down.fetch_add(1, Ordering::Relaxed);
         return Captured::Passthrough(packet.data.into_owned());
     }
 
@@ -788,10 +983,12 @@ fn service_tcp_flows(
     for (key, flow) in tcp_flows.iter_mut() {
         match &mut flow.state {
             TcpState::Pending => {
-                // Half-open that never completes (blackholed SYN, app gave
-                // up): free the key instead of burning the ephemeral port
-                // forever — the next SYN for it must build a fresh listener.
-                if now.duration_since(flow.last_active) > Duration::from_secs(30) {
+                // Half-open that never completes (app abandoned the raced
+                // socket, blackholed SYN): free the key instead of burning
+                // the 4-tuple — the next SYN for it must build a fresh
+                // listener (see PENDING_TCP_TIMEOUT).
+                if now.duration_since(flow.last_active) > PENDING_TCP_TIMEOUT {
+                    stats.pending_timeouts.fetch_add(1, Ordering::Relaxed);
                     close_note(
                         &bus,
                         flow,
@@ -803,7 +1000,7 @@ fn service_tcp_flows(
                     let socket = sockets.get_mut::<tcp::Socket>(flow.handle);
                     if matches!(socket.state(), tcp::State::Closed) {
                         // RST before the handshake completed: retire now
-                        // instead of squatting the key for the 30s timeout.
+                        // instead of waiting out PENDING_TCP_TIMEOUT.
                         close_note(&bus, flow, key, "rst-before-connect");
                         flow.state = TcpState::Closed;
                     } else if socket.state() == tcp::State::Established {
@@ -1094,10 +1291,12 @@ async fn tcp_bridge(
     mut from_app: mpsc::Receiver<Vec<u8>>,
     to_app: mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
-    // 15s connect cap: into a dead/blackholed tunnel, connect() would hang
-    // for minutes with zero visibility (no BridgeFailed, app just stalls).
-    // Failing fast retires the flow, frees the key, and tells the log why.
-    const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+    // 5s connect cap (was 15s): app-side data is already queued by the time
+    // this runs, so a longer cap only delays the failure. A dead/blackholed
+    // tunnel now retires the flow — and logs BridgeFailed — in 5s instead of
+    // stalling the app for 15, while still covering slow but live
+    // destinations (SYN-ACK RTT well under 5s is the norm even via VPN).
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
     let stream = match target {
         Some(t) => {
             let socket = tokio::net::TcpSocket::new_v4()?;
@@ -1290,22 +1489,76 @@ fn build_udp_packet(
 }
 
 struct Stats {
-    passed: AtomicU64,
+    /// Passthrough, split by the branch that decided it — a single "passed"
+    /// counter could not tell malformed input from plain non-tunneled traffic,
+    /// which is exactly what made the constant ~190 pps floor unreadable.
+    pass_malformed: AtomicU64,
+    pass_dns: AtomicU64,
+    pass_untun: AtomicU64,
+    pass_vpn_down: AtomicU64,
+    /// Packets that missed the fast flow-table/pidlookup path and paid the
+    /// ~1 ms retry loop (the prime suspect for a userspace pps ceiling).
+    pid_stalls: AtomicU64,
+    /// Local endpoints that recently failed PID resolution, keyed
+    /// (proto, src_port, src_ip). See PID_NEG_TTL.
+    neg_pid: Mutex<HashMap<(u8, u16, u32), Instant>>,
+    /// Bytes handed back to the kernel as passthrough (all passthrough
+    /// classes). The tunneled byte counters (bus.bytes_*) say nothing about
+    /// untunneled throughput, so this is the only way to compare what we
+    /// actually carried against what the browser reports.
+    pass_bytes: AtomicU64,
+    /// WinDivert recv errors. A full queue drops packets inside the driver
+    /// where we cannot see them; a recv error at least proves starvation.
+    recv_err: AtomicU64,
+    /// Outer-loop iterations and the microseconds spent in each phase, summed
+    /// since the last 5s report is derived from the totals.
+    loops: AtomicU64,
+    us_recv: AtomicU64,
+    us_flush: AtomicU64,
+    us_svc: AtomicU64,
+    /// Untunneled packets attributed to (proto, dst_port, dst_ip) since the
+    /// last 5s report. Naming the floor's owner is the whole point.
+    untun_dst: Mutex<HashMap<(u8, u16, u32), u64>>,
+    /// Same, by owning PID (0 = unresolved), so the report can name the app
+    /// (e.g. firefox.exe) rather than only a destination.
+    untun_pid: Mutex<HashMap<u32, u64>>,
     captured: AtomicU64,
     injected: AtomicU64,
     bridges_opened: AtomicU64,
     bridges_closed: AtomicU64,
+    /// Flows retired by PENDING_TCP_TIMEOUT: the app never completed the
+    /// local handshake. Chrome's racing losers dominate this count; a spike
+    /// beyond "races observed" would implicate our SYN-ACK injection under
+    /// load (see PENDING_TCP_TIMEOUT).
+    pending_timeouts: AtomicU64,
+    /// Used only by the 5s report to turn a top PID into an exe name.
+    resolver: Arc<Resolver>,
     bus: Arc<StatusBus>,
 }
 
 impl Stats {
-    fn new(bus: Arc<StatusBus>) -> Self {
+    fn new(bus: Arc<StatusBus>, resolver: Arc<Resolver>) -> Self {
         Self {
-            passed: AtomicU64::new(0),
+            pass_malformed: AtomicU64::new(0),
+            pass_dns: AtomicU64::new(0),
+            pass_untun: AtomicU64::new(0),
+            pass_vpn_down: AtomicU64::new(0),
+            pid_stalls: AtomicU64::new(0),
+            neg_pid: Mutex::new(HashMap::new()),
+            pass_bytes: AtomicU64::new(0),
+            recv_err: AtomicU64::new(0),
+            loops: AtomicU64::new(0),
+            us_recv: AtomicU64::new(0),
+            us_flush: AtomicU64::new(0),
+            us_svc: AtomicU64::new(0),
+            untun_dst: Mutex::new(HashMap::new()),
+            untun_pid: Mutex::new(HashMap::new()),
             captured: AtomicU64::new(0),
             injected: AtomicU64::new(0),
             bridges_opened: AtomicU64::new(0),
             bridges_closed: AtomicU64::new(0),
+            pending_timeouts: AtomicU64::new(0),
+            resolver,
             bus,
         }
     }
@@ -1323,13 +1576,30 @@ impl Stats {
         self.bus.add_pid_in(pid, n);
     }
 
+    /// Attribute an untunneled packet to its destination so the 5s report can
+    /// name whatever produces the constant passthrough floor. The lock is
+    /// uncontended: this runs only on the single divert thread.
+    fn note_untun(&self, proto: u8, dst_port: u16, dst_ip: Ipv4Addr, pid: Option<u32>) {
+        if let Ok(mut m) = self.untun_dst.lock() {
+            *m.entry((proto, dst_port, u32::from(dst_ip))).or_insert(0) += 1;
+        }
+        if let Ok(mut m) = self.untun_pid.lock() {
+            *m.entry(pid.unwrap_or(0)).or_insert(0) += 1;
+        }
+    }
+
     fn report_loop(&self) {
         let start = Instant::now();
         let mut last = [0u64; 7];
+        let mut last2 = [0u64; 8];
+        let mut last3 = [0u64; 4];
         loop {
             std::thread::sleep(Duration::from_secs(5));
             let cur = [
-                self.passed.load(Ordering::Relaxed),
+                self.pass_malformed.load(Ordering::Relaxed)
+                    + self.pass_dns.load(Ordering::Relaxed)
+                    + self.pass_untun.load(Ordering::Relaxed)
+                    + self.pass_vpn_down.load(Ordering::Relaxed),
                 self.captured.load(Ordering::Relaxed),
                 self.injected.load(Ordering::Relaxed),
                 self.bridges_opened.load(Ordering::Relaxed),
@@ -1343,6 +1613,186 @@ impl Stats {
                 "divert 5s: pass={} cap={} inj={} bridges +{}/-{} a→r={}B r→a={}B (uptime {:?})",
                 d[0], d[1], d[2], d[3], d[4], d[5], d[6], start.elapsed()
             );
+            // Passthrough breakdown (5s deltas): which branch produced the
+            // floor, and how often the ~1 ms PID retry loop was paid.
+            let cur2 = [
+                self.pass_malformed.load(Ordering::Relaxed),
+                self.pass_dns.load(Ordering::Relaxed),
+                self.pass_untun.load(Ordering::Relaxed),
+                self.pass_vpn_down.load(Ordering::Relaxed),
+                self.pid_stalls.load(Ordering::Relaxed),
+                self.recv_err.load(Ordering::Relaxed),
+                self.pending_timeouts.load(Ordering::Relaxed),
+                self.pass_bytes.load(Ordering::Relaxed),
+            ];
+            let e: Vec<u64> = cur2.iter().zip(&last2).map(|(a, b)| a - b).collect();
+            last2 = cur2;
+            tracing::info!(
+                "divert 5s detail: malformed={} dns={} untunneled={} vpndown={} pid_stall={} recv_err={} pending_timeout={} passthrough={}B ({:.2} mbps)",
+                e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7],
+                (e[7] as f64) * 8.0 / 5.0 / 1_000_000.0
+            );
+            // Who owns the untunneled floor? Top 5 destinations this window.
+            let mut top: Vec<((u8, u16, u32), u64)> = self
+                .untun_dst
+                .lock()
+                .map(|mut m| m.drain().collect())
+                .unwrap_or_default();
+            top.sort_by(|a, b| b.1.cmp(&a.1));
+            let top_str = top
+                .iter()
+                .take(5)
+                .map(|((proto, port, ip), n)| {
+                    format!(
+                        "{}{}:{}={}",
+                        if *proto == PROTO_TCP { "tcp/" } else { "udp/" },
+                        Ipv4Addr::from(*ip),
+                        port,
+                        n
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!("divert 5s untunneled top: {}", top_str);
+            // And by owning process, so the floor is named (firefox.exe, ...).
+            let mut topp: Vec<(u32, u64)> = self
+                .untun_pid
+                .lock()
+                .map(|mut m| m.drain().collect())
+                .unwrap_or_default();
+            topp.sort_by(|a, b| b.1.cmp(&a.1));
+            let topp_str = topp
+                .iter()
+                .take(5)
+                .map(|(pid, n)| {
+                    if *pid == 0 {
+                        format!("unresolved={}", n)
+                    } else {
+                        let name = self
+                            .resolver
+                            .resolve(*pid)
+                            .map(|i| i.exe_name)
+                            .unwrap_or_else(|| format!("pid{}", pid));
+                        format!("{}={}", name, n)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!("divert 5s untunneled by pid: {}", topp_str);
+            // Phase timing: if iters/s is pinned low while pkts/iter is ~1,
+            // the loop itself (not the traffic) is the throughput ceiling.
+            let cur3 = [
+                self.loops.load(Ordering::Relaxed),
+                self.us_recv.load(Ordering::Relaxed),
+                self.us_flush.load(Ordering::Relaxed),
+                self.us_svc.load(Ordering::Relaxed),
+            ];
+            let f: Vec<u64> = cur3.iter().zip(&last3).map(|(a, b)| a - b).collect();
+            last3 = cur3;
+            let handled = d[0] + d[1];
+            tracing::info!(
+                "divert 5s loop: iters={} handled={} pkts/iter={:.2} recv={}ms flush={}ms svc={}ms",
+                f[0],
+                handled,
+                if f[0] > 0 { handled as f64 / f[0] as f64 } else { 0.0 },
+                f[1] / 1000,
+                f[2] / 1000,
+                f[3] / 1000
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CAPTURE_FILTER;
+    use crate::flows::{PROTO_TCP, PROTO_UDP};
+    use std::ffi::{c_char, c_void, CStr, CString};
+
+    /// Regression guard for the Oct-16 breakage: `not (...)` is a WinDivert
+    /// parse error, which becomes ERROR_INVALID_PARAMETER (87) on
+    /// `WinDivertOpen` and aborts the backend. `WinDivertHelperCompileFilter`
+    /// validates the exact string we hand to WinDivert with no driver and no
+    /// elevation, so this test fails loudly if the filter is ever made
+    /// unparseable again.
+    #[test]
+    fn capture_filter_compiles() {
+        let filter = CString::new(CAPTURE_FILTER).expect("filter has no NUL");
+        let mut object: Vec<c_char> = vec![0; 8192];
+        let mut error_str: *const c_char = std::ptr::null();
+        let mut error_pos: u32 = 0;
+        let ok = unsafe {
+            windivert_sys::WinDivertHelperCompileFilter(
+                filter.as_ptr(),
+                windivert_sys::WinDivertLayer::Network,
+                object.as_mut_ptr(),
+                object.len() as u32,
+                &mut error_str,
+                &mut error_pos,
+            )
+        };
+        let detail = if error_str.is_null() {
+            "(no error string)".to_string()
+        } else {
+            unsafe { CStr::from_ptr(error_str) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert_ne!(ok, 0, "WinDivert rejected CAPTURE_FILTER at pos {error_pos}: {detail}");
+    }
+
+    /// Regression guard for the follow-on breakage: a filter can compile yet
+    /// match NOTHING. WinDivert evaluates an absent layer's field as false, so
+    /// a flat `tcp.DstPort != 53 and udp.DstPort != 53` conjunction silently
+    /// drops every packet. This evals crafted outbound IPv4 TCP/UDP frames
+    /// against the real filter (no driver/elevation needed) and asserts the
+    /// actual capture verdicts.
+    #[test]
+    fn capture_filter_semantics() {
+        fn ipv4(proto: u8, dst_port: u16) -> Vec<u8> {
+            let mut ip = vec![0u8; 20];
+            ip[0] = 0x45; // IPv4, IHL 5
+            ip[8] = 64; // TTL
+            ip[9] = proto;
+            ip[12..16].copy_from_slice(&[192, 168, 68, 100]);
+            ip[16..20].copy_from_slice(&[1, 1, 1, 1]);
+            let l4_len = if proto == PROTO_TCP { 20 } else { 8 };
+            let mut l4 = vec![0u8; l4_len];
+            l4[0..2].copy_from_slice(&51234u16.to_be_bytes());
+            l4[2..4].copy_from_slice(&dst_port.to_be_bytes());
+            if proto == PROTO_TCP {
+                l4[12] = 0x50; // data offset 5
+            }
+            let total = (20 + l4_len) as u16;
+            ip[2..4].copy_from_slice(&total.to_be_bytes());
+            ip.extend_from_slice(&l4);
+            ip
+        }
+
+        fn captured(pkt: &[u8]) -> bool {
+            // WINDIVERT_ADDRESS: Timestamp(8) + bitfield(4) + reserved(4) +
+            // union(48). Layer = NETWORK(0), Outbound = bit 17 → 0x00020000.
+            let mut addr = [0u8; 64];
+            addr[8..12].copy_from_slice(&(1u32 << 17).to_ne_bytes());
+            let filter = CString::new(CAPTURE_FILTER).expect("filter has no NUL");
+            let ok = unsafe {
+                windivert_sys::WinDivertHelperEvalFilter(
+                    filter.as_ptr(),
+                    pkt.as_ptr() as *const c_void,
+                    pkt.len() as u32,
+                    addr.as_ptr() as *const windivert_sys::address::WINDIVERT_ADDRESS,
+                )
+            };
+            ok != 0
+        }
+
+        // Tunneled-app traffic must be captured...
+        assert!(captured(&ipv4(PROTO_TCP, 443)), "TCP:443 must be captured");
+        assert!(captured(&ipv4(PROTO_UDP, 443)), "UDP:443 must be captured");
+        // ...while DNS / mDNS / LLMNR is skipped.
+        assert!(!captured(&ipv4(PROTO_TCP, 53)), "TCP:53 must be excluded");
+        assert!(!captured(&ipv4(PROTO_UDP, 53)), "UDP:53 must be excluded");
+        assert!(!captured(&ipv4(PROTO_UDP, 5353)), "UDP:5353 must be excluded");
+        assert!(!captured(&ipv4(PROTO_UDP, 5355)), "UDP:5355 must be excluded");
     }
 }

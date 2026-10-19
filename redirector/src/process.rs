@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Threading::{
@@ -13,14 +14,22 @@ pub struct ProcessInfo {
     pub exe_name: String,
 }
 
+/// How long a cached parent answer stays valid. Parent PIDs are immutable for
+/// a live process, so the TTL only guards against PID reuse after death (and
+/// `retain_alive` already evicts dead entries on the GC tick).
+const PARENT_TTL: Duration = Duration::from_secs(10);
+const PARENT_CACHE_MAX: usize = 4096;
+
 pub struct Resolver {
     cache: Mutex<HashMap<u32, Option<ProcessInfo>>>,
+    parents: Mutex<HashMap<u32, (Option<u32>, Instant)>>,
 }
 
 impl Resolver {
     pub fn new() -> Self {
         Self {
             cache: Mutex::new(HashMap::new()),
+            parents: Mutex::new(HashMap::new()),
         }
     }
 
@@ -65,10 +74,29 @@ impl Resolver {
         info
     }
 
-    /// Parent PID via Toolhelp32 snapshot. Uncached (cheap enough at
-    /// first-packet rate, and parent relationships change over time).
+    /// Parent PID via Toolhelp32 snapshot, cached per pid for PARENT_TTL.
+    ///
+    /// The snapshot is a full process-table walk (allocation + one
+    /// PROCESSENTRY32W per process). The untunneled admission path asks for
+    /// the same parent on EVERY packet of a flow, so an uncached call here
+    /// caps the capture loop at a few hundred pps — which a download's ACK
+    /// stream then inherits as a hard throughput ceiling.
     pub fn parent_of(&self, pid: u32) -> Option<u32> {
-        parent_pid(pid)
+        if let Ok(parents) = self.parents.lock() {
+            if let Some((ppid, at)) = parents.get(&pid) {
+                if at.elapsed() < PARENT_TTL {
+                    return *ppid;
+                }
+            }
+        }
+        let ppid = parent_pid(pid);
+        if let Ok(mut parents) = self.parents.lock() {
+            if parents.len() > PARENT_CACHE_MAX {
+                parents.clear();
+            }
+            parents.insert(pid, (ppid, Instant::now()));
+        }
+        ppid
     }
 
     /// Drop cache entries for dead PIDs. A stale entry maps a recycled PID
@@ -77,6 +105,9 @@ impl Resolver {
     pub fn retain_alive(&self, alive: &std::collections::HashSet<u32>) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.retain(|p, _| alive.contains(p));
+        }
+        if let Ok(mut parents) = self.parents.lock() {
+            parents.retain(|p, _| alive.contains(p));
         }
     }
 }
@@ -129,5 +160,48 @@ fn lookup(pid: u32) -> Option<ProcessInfo> {
             exe_path: path,
             exe_name,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_of_matches_raw_snapshot_for_live_pid() {
+        let r = Resolver::new();
+        let me = std::process::id();
+        // The test process always has a parent (cargo/nextest/the shell), so
+        // this exercises the real snapshot path, not the None branch.
+        assert_eq!(r.parent_of(me), parent_pid(me));
+    }
+
+    #[test]
+    fn parent_of_is_stable_across_calls() {
+        let r = Resolver::new();
+        let me = std::process::id();
+        let first = r.parent_of(me);
+        let second = r.parent_of(me); // cache hit
+        assert_eq!(first, second);
+        assert_eq!(first, parent_pid(me));
+    }
+
+    #[test]
+    fn parent_of_re_snapshots_after_eviction() {
+        let r = Resolver::new();
+        let me = std::process::id();
+        let first = r.parent_of(me);
+        // Proc-watcher GC pass: every pid is "dead" so both caches clear.
+        r.retain_alive(&std::collections::HashSet::new());
+        assert_eq!(r.parent_of(me), first);
+    }
+
+    #[test]
+    fn parent_of_unknown_pid_is_none() {
+        let r = Resolver::new();
+        // PIDs are 32-bit and allocated from a small pool; 0xFFFF_FFFE can
+        // never name a live process, so the walk finishes with no match.
+        assert_eq!(r.parent_of(u32::MAX - 1), None);
+        assert_eq!(r.parent_of(u32::MAX - 1), None); // cached None, still None
     }
 }

@@ -324,53 +324,32 @@ public class VpnConnector
         // by default (proven by working setups); forcing wintun had no
         // effect (DCO was opened anyway) and only added a fallback variable.
         //
-        // Full tunnel (default): accept the server-pushed redirect-gateway so
-        // ALL traffic egresses via the VPN — exactly like the known-working
-        // plain script launch. Proven necessary on Proton+DCO: stripping the
-        // redirect leaves a tunnel that completes its handshake and then
-        // dies within seconds (write UDP ... code=1232), killing connectivity
-        // for listed AND unlisted apps alike.
+        // Split tunnel is the only mode: traffic goes through the VPN only
+        // for apps the user listed (pinned via IP_UNICAST_IF + the
+        // redirector's per-app routing). The server-pushed redirect-gateway is
+        // filtered so it can't drag ALL traffic into the tunnel.
         //
-        // Split-tunnel (FullTunnel=false): filter the redirect so only listed
-        // apps are pinned to the tunnel via IP_UNICAST_IF. Experimental on
-        // providers whose data-path depends on the pushed redirect.
-        //
-        // NOTE: pushed DNS (dhcp-option) handling differs per mode.
-        //
-        // Full tunnel: ACCEPTED, matching the known-working plain script
-        // launch. All traffic (including DNS) belongs in the tunnel there.
-        //
-        // Split-tunnel: IGNORED. Accepting it registers 10.96.0.1 as system
-        // DNS, and Windows then sends EVERY app's lookups into the tunnel:
-        // measured 2s x 2 timeouts per fresh hostname vs instant on LAN DNS,
-        // plus geo-mismatched answers (CDN edges near the VPN country, not
-        // the user). Untunneled apps felt this as "internet lambat".
-        // Tunneled apps keep working because the redirector passes port-53
-        // through to the kernel (see divert.rs) instead of bridging it into
-        // the tunnel blackhole. Trade-off, stated openly: DNS names of
+        // Pushed DNS (dhcp-option) is IGNORED. Accepting it registers
+        // 10.96.0.1 as system DNS, and Windows then sends EVERY app's lookups
+        // into the tunnel: measured 2s x 2 timeouts per fresh hostname vs
+        // instant on LAN DNS, plus geo-mismatched answers (CDN edges near the
+        // VPN country, not the user). Untunneled apps felt this as "internet
+        // lambat". Tunneled apps keep working because the redirector passes
+        // port-53 through to the kernel (see divert.rs) instead of bridging it
+        // into the tunnel blackhole. Trade-off, stated openly: DNS names of
         // tunneled apps are visible to the LAN resolver; their traffic stays
         // in the tunnel.
         //
-        // block-outside-dns is still filtered in both modes: it would install
-        // WFP rules forcing ALL host DNS through the tunnel, breaking
-        // untunneled apps whenever the tunnel DNS is unreachable from LAN.
+        // block-outside-dns is filtered: it would install WFP rules forcing
+        // ALL host DNS through the tunnel, breaking untunneled apps whenever
+        // the tunnel DNS is unreachable from LAN.
         //
         // --auth-nocache avoids caching passwords in memory (also silences
         // the openvpn warning); reconnects re-read our auth file anyway.
-        bool fullTunnel = true;
-        try { fullTunnel = Config.Load().FullTunnel; } catch { }
-        // Tell the redirector which mode we run: in split mode it cleans up
-        // stale full-tunnel leftovers and installs its own route; in full
-        // mode it leaves routing to openvpn. Written before openvpn starts
-        // so it is always fresh when the adapter appears.
-        try { File.WriteAllText(Path.Combine(runtimeDir, "mode.txt"), fullTunnel ? "full" : "split"); } catch { }
         args.Append($"--management 127.0.0.1 {mgmtPort} ");
         args.Append("--auth-nocache ");
-        if (!fullTunnel)
-        {
-            args.Append("--pull-filter ignore \"redirect-gateway\" ");
-            args.Append("--pull-filter ignore \"dhcp-option\" ");
-        }
+        args.Append("--pull-filter ignore \"redirect-gateway\" ");
+        args.Append("--pull-filter ignore \"dhcp-option\" ");
         args.Append("--pull-filter ignore \"block-outside-dns\" ");
         args.Append($"--log \"{logFile}\" ");
         args.Append("--verb 3");

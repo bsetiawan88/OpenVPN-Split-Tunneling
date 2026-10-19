@@ -1,0 +1,62 @@
+;
+; VpnWfpCallout.inf — WFP callout driver for OpenVPN Split Tunneling
+;
+; Modeled on ProxifierDrv.inf (Class=WFPCALLOUTS, BFE dependency,
+; Extended Base group) observed via REA on ProxifierDrv.sys.
+; Service name is intentionally distinct (VpnWfpCallout) so both
+; drivers can coexist during migration.
+;
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=WFPCALLOUTS
+ClassGuid={57465043-616C-6C6F-7574-5F636C617373}
+Provider=%ProviderString%
+CatalogFile=VpnWfpCallout.cat
+DriverVer=10/16/2026,0.1.0.0
+
+[SourceDisksNames]
+1=%VpnWfpCalloutDisk%,,,""
+
+[SourceDisksFiles]
+VpnWfpCallout.sys=1,,
+
+[DestinationDirs]
+DefaultDestDir=12 ; %WinDir%\System32\Drivers
+VpnWfpCallout.DriverFiles=12
+
+; x64-only: build.ps1 compiles /p:Platform=x64 and installer targets
+; ArchitecturesAllowed=x64compatible, so no .ntx86 / .ntarm64 sections.
+; DriverInstall.ps1 invokes DefaultInstall 132, which resolves to
+; DefaultInstall.ntamd64 on x64.
+[DefaultInstall.ntamd64]
+OptionDesc=%VpnWfpCalloutServiceDesc%
+CopyFiles=VpnWfpCallout.DriverFiles
+
+[DefaultInstall.ntamd64.Services]
+AddService=%VpnWfpCalloutServiceName%,0x00000800,VpnWfpCallout.Service
+
+[DefaultUninstall.ntamd64]
+LegacyUninstall=1
+
+[DefaultUninstall.ntamd64.Services]
+DelService=%VpnWfpCalloutServiceName%,0x200
+
+[VpnWfpCallout.DriverFiles]
+VpnWfpCallout.sys,,,0x00000004 ; COPYFLG_NOVERSIONCHECK
+
+[VpnWfpCallout.Service]
+DisplayName=%VpnWfpCalloutServiceName%
+Description=%VpnWfpCalloutServiceDesc%
+ServiceType=1            ; SERVICE_KERNEL_DRIVER
+StartType=2              ; SERVICE_AUTO_START
+ErrorControl=1           ; SERVICE_ERROR_NORMAL
+ServiceBinary=%12%\VpnWfpCallout.sys
+LoadOrderGroup=Extended Base
+Dependencies=BFE
+
+[Strings]
+ProviderString="OpenVPN Split Tunneling (WFP backend)"
+VpnWfpCalloutDisk="VpnWfpCallout Installation Disk"
+VpnWfpCalloutServiceDesc="VpnWfpCallout Callout Driver (split-tunnel redirect)"
+VpnWfpCalloutServiceName="VpnWfpCallout"

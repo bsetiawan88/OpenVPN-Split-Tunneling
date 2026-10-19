@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::adapter::{self, VpnTarget};
+use crate::forward_table::{self, ForwardEntry};
 use crate::status_server::StatusBus;
 use ipc::status::EventKind;
 
@@ -25,7 +26,9 @@ pub fn current(state: &VpnState) -> Option<VpnTarget> {
 pub async fn watcher(state: VpnState, bus: Arc<StatusBus>) -> Result<()> {
     let mut last: Option<VpnTarget> = None;
     let mut last_gateway: Option<Ipv4Addr> = None;
+    let mut ticks: u64 = 0;
     loop {
+        ticks = ticks.wrapping_add(1);
         // enumerate() failing (or its thread panicking) used to exit the
         // whole process via main's select! with zero trace. Retry instead:
         // a fresh thread is spawned every tick, so nothing wedges.
@@ -42,6 +45,12 @@ pub async fn watcher(state: VpnState, bus: Arc<StatusBus>) -> Result<()> {
                 continue;
             }
         };
+        // Leaked def1 routes on a *down* VPN interface are orphaned by
+        // definition (a down interface carries no legit traffic) and are
+        // invisible to `route print`, so sweep them every tick. This is what
+        // catches the leak before our adapter-up cleanup even runs — the
+        // classic "openvpn connects, then dies with write UDP code=1232".
+        sweep_orphan_def1_routes(&adapters, &bus).await;
         let now = adapter::find_vpn_target(&adapters);
         let same = match (last, now) {
             (Some(a), Some(b)) => {
@@ -59,13 +68,12 @@ pub async fn watcher(state: VpnState, bus: Arc<StatusBus>) -> Result<()> {
                         EventKind::VpnUp,
                         format!("VPN adapter up at {} (ifindex {})", t.ipv4, t.if_index),
                     );
-                    // Split mode only: stale full-tunnel leftovers (0.0.0.0/1
-                    // + 128.0.0.0/1 from taskkill'd runs) would otherwise keep
-                    // hijacking ALL traffic — including openvpn's own link
-                    // socket — into a dead tunnel. Our split run installs no
-                    // server /32 bypass (redirect was stripped), so those
-                    // stale routes are pure poison here. Full mode skips this:
-                    // openvpn manages its own pushed routes.
+                    // Stale full-tunnel leftovers (0.0.0.0/1 + 128.0.0.0/1
+                    // from taskkill'd runs) would otherwise keep hijacking ALL
+                    // traffic — including openvpn's own link socket — into a
+                    // dead tunnel. Our split run installs no server /32 bypass
+                    // (redirect was stripped), so those stale routes are pure
+                    // poison here.
                     cleanup_stale_tunnel_routes(t, &bus).await;
                     last_gateway = ensure_split_tunnel_route(t).await;
                     bus.route_ok.store(
@@ -150,6 +158,14 @@ pub async fn watcher(state: VpnState, bus: Arc<StatusBus>) -> Result<()> {
             *state.write().unwrap() = now;
             last = now;
         } else if let Some(t) = now {
+            // Re-sweep while the tunnel is up, but only every ~10s:
+            // resolve_gateway may read the openvpn log, which must not sit on
+            // the 2s path. A def1 leak created after the up-transition cleanup
+            // would otherwise hijack the freshly-built tunnel.
+            if ticks % 5 == 0 {
+                cleanup_stale_tunnel_routes(t, &bus).await;
+            }
+
             // Adapter steady but route missing (earlier ADD failed) — retry
             // the install instead of leaving the tunnel half-built forever.
             // No backoff beyond the 2s poll: route.exe is cheap and the
@@ -199,7 +215,7 @@ async fn ensure_split_tunnel_route(target: VpnTarget) -> Option<Ipv4Addr> {
         // OpenVPN configures the address first and installs routes a moment
         // later (DHCP / pushed routes). Retry briefly before giving up.
         for attempt in 0..10 {
-            if let Some(gw) = find_vpn_gateway(target.ipv4).await {
+            if let Some(gw) = find_vpn_gateway(target.ipv4, target.if_index) {
                 gateway = Some(gw);
                 break;
             }
@@ -266,19 +282,32 @@ async fn ensure_split_tunnel_route(target: VpnTarget) -> Option<Ipv4Addr> {
 }
 
 async fn remove_split_tunnel_route(gateway: Ipv4Addr, ifindex: u32) {
-    tracing::info!("removing split-tunnel route: 0.0.0.0/0 via {}", gateway);
-    let _ = tokio::process::Command::new("route.exe")
-        .args([
-            "DELETE",
-            "0.0.0.0",
-            "MASK",
-            "0.0.0.0",
-            &gateway.to_string(),
-            "IF",
-            &ifindex.to_string(),
-        ])
-        .output()
-        .await;
+    // API-based so a route on an already-down VPN interface is still
+    // removable — `route.exe` cannot see such rows (same blindness as
+    // `route print`), which used to leak our own 0.0.0.0/0 on teardown.
+    let rows = match forward_table::list_v4() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("removing split-tunnel route: enumeration failed ({:#})", e);
+            return;
+        }
+    };
+    let ours = rows.iter().filter(|r| {
+        r.dest.is_unspecified()
+            && r.prefix_len == 0
+            && r.if_index == ifindex
+            && r.next_hop == gateway
+    });
+    for row in ours {
+        match forward_table::delete(row) {
+            Ok(()) => tracing::info!(
+                "removed split-tunnel route: 0.0.0.0/0 via {} ifindex {}",
+                gateway,
+                ifindex
+            ),
+            Err(e) => tracing::warn!("removing split-tunnel route failed: {:#}", e),
+        }
+    }
 }
 
 /// Gateway resolution order:
@@ -303,24 +332,6 @@ async fn resolve_gateway(target: VpnTarget) -> Option<Ipv4Addr> {
         return Some(gw);
     }
     None
-}
-
-/// UI-selected tunnel mode, written by the UI on every openvpn start to
-/// %LocalAppData%\VpnClient\runtime\mode.txt ("full" | "split").
-/// Missing/unreadable (old UI, never started) defaults to full: never touch
-/// another manager's routes unless split was explicitly requested.
-fn split_mode() -> bool {
-    let Ok(local) = std::env::var("LOCALAPPDATA") else {
-        return false;
-    };
-    let path = PathBuf::from(local)
-        .join("VpnClient")
-        .join("runtime")
-        .join("mode.txt");
-    matches!(
-        std::fs::read_to_string(path).map(|s| s.trim().to_lowercase()),
-        Ok(s) if s == "split"
-    )
 }
 
 /// Latest `route-gateway <ip>` from the openvpn log tail. OpenVPN logs the
@@ -362,118 +373,95 @@ fn gateway_from_openvpn_log() -> Option<Ipv4Addr> {
     found
 }
 
-/// Split mode only: remove stale full-tunnel leftovers
-/// (0.0.0.0/128.0.0.0 + 128.0.0.0/128.0.0.0) that taskkill'd runs leak.
-/// Those rows keep hijacking ALL IPv4 — including openvpn's own link
-/// socket (hence post-handshake `write UDP ... code=1232` death) and every
-/// untunneled app — into a dead tunnel, while our split run (redirect
-/// stripped) installs no server /32 bypass that would save them.
-/// Only rows via our VPN gateway or on our VPN interface are touched, so a
-/// parallel unrelated VPN on another interface is left alone.
+/// Remove stale full-tunnel leftovers
+/// (0.0.0.0/1 + 128.0.0.0/1) that crashed/killed runs leak. Those rows keep
+/// hijacking ALL IPv4 — including openvpn's own link socket (hence the
+/// post-handshake `write UDP ... code=1232` death) and every untunneled app —
+/// into a dead tunnel, while our split run (redirect stripped) installs no
+/// server /32 bypass that would save them.
+///
+/// Enumeration goes through the IP Helper API (see `forward_table`), NOT
+/// `route print`: the netstat table omits rows on a down interface, which is
+/// exactly where these leftovers sit while OpenVPN is idle. Only rows on our
+/// VPN interface, or via our known gateway, are touched — a parallel
+/// unrelated VPN on another interface is left alone.
 ///
 /// PLUS: /32 rows via our VPN gateway. A server-bypass pointing INTO the
 /// tunnel is circular by definition (openvpn never installs those; only
 /// leaks/bugs create them) and kills the link socket the same way. Strict
-/// gw-match only here — a public server is never legitimately on-link, so
-/// the iface arm is deliberately not applied to /32s.
+/// gw-match only here — a public server is never legitimately on-link.
 async fn cleanup_stale_tunnel_routes(target: VpnTarget, bus: &StatusBus) {
-    if !split_mode() {
-        return;
-    }
     let vpn_gw = resolve_gateway(target).await;
-    let rows = list_tunnel_routes().await;
-    let host_rows = list_circular_host_routes(vpn_gw).await;
-    if rows.is_empty() && host_rows.is_empty() {
+    let rows = match forward_table::list_v4() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("split cleanup: route enumeration failed ({:#})", e);
+            return;
+        }
+    };
+    let def1: Vec<&ForwardEntry> = rows
+        .iter()
+        .filter(|r| is_def1_row(r.dest, r.prefix_len))
+        .collect();
+    let circular: Vec<&ForwardEntry> = match vpn_gw {
+        Some(gw) => rows
+            .iter()
+            .filter(|r| r.prefix_len == 32 && r.next_hop == gw)
+            .collect(),
+        None => Vec::new(),
+    };
+    if def1.is_empty() && circular.is_empty() {
         return;
     }
-    let vpn_ip = target.ipv4.to_string();
     let mut removed = 0;
-    for (dest, _gw_str, gw, iface) in rows {
+    for row in def1 {
         // Guard the gw comparison: when our own gateway is unknown (None),
-        // `None == None` would match ANY on-link row — including a parallel
-        // unrelated VPN's. Only touch rows on our interface, or rows via our
-        // known gateway.
-        let ours = iface == vpn_ip || (vpn_gw.is_some() && gw == vpn_gw);
+        // matching on it would hit ANY interface. Only touch rows on our VPN
+        // interface, or rows via our known gateway.
+        let ours =
+            row.if_index == target.if_index || (vpn_gw.is_some() && Some(row.next_hop) == vpn_gw);
         if !ours {
             continue;
         }
-        let mut args = vec![
-            "DELETE".to_string(),
-            dest.clone(),
-            "MASK".to_string(),
-            "128.0.0.0".to_string(),
-        ];
-        if let Some(g) = gw {
-            args.push(g.to_string());
-        } else {
-            // On-link row (no gateway): scope by interface index.
-            args.push("IF".to_string());
-            args.push(target.if_index.to_string());
-        }
-        let output = tokio::process::Command::new("route.exe")
-            .args(&args)
-            .output()
-            .await;
-        match output {
-            Ok(o) if o.status.success() => {
+        match forward_table::delete(row) {
+            Ok(()) => {
                 removed += 1;
                 tracing::warn!(
-                    "split cleanup: removed stale tunnel route {} via {}",
-                    dest,
-                    gw.map(|g| g.to_string()).unwrap_or_else(|| iface.clone())
+                    "split cleanup: removed stale tunnel route {}/{} via {} (if{})",
+                    row.dest,
+                    row.prefix_len,
+                    row.next_hop,
+                    row.if_index
                 );
             }
-            Ok(o) => {
-                tracing::info!(
-                    "split cleanup: route DELETE {} failed (may already be gone): {}",
-                    dest,
-                    String::from_utf8_lossy(&o.stderr).trim()
-                );
-            }
-            Err(e) => {
-                tracing::warn!("split cleanup: route.exe failed: {}", e);
-                break;
-            }
+            Err(e) => tracing::info!(
+                "split cleanup: delete {}/{} failed (may already be gone): {:#}",
+                row.dest,
+                row.prefix_len,
+                e
+            ),
         }
     }
-    for (dest, _gw_str, gw, _iface) in host_rows {
-        // Strict gateway match only (guarded by is_some, same None==None
-        // lesson as above): a /32 via OUR gateway is circular by
+    for row in circular {
+        // Strict gateway match only: a /32 via OUR gateway is circular by
         // definition. No iface arm — a public server is never on-link.
-        let ours = vpn_gw.is_some() && gw == vpn_gw;
-        if !ours {
+        if Some(row.next_hop) != vpn_gw {
             continue;
         }
-        let gw = gw.unwrap();
-        let output = tokio::process::Command::new("route.exe")
-            .args([
-                "DELETE",
-                &dest,
-                "MASK",
-                "255.255.255.255",
-                &gw.to_string(),
-            ])
-            .output()
-            .await;
-        match output {
-            Ok(o) if o.status.success() => {
+        match forward_table::delete(row) {
+            Ok(()) => {
                 removed += 1;
                 tracing::warn!(
                     "split cleanup: removed circular host route {} via {}",
-                    dest, gw
+                    row.dest,
+                    row.next_hop
                 );
             }
-            Ok(o) => {
-                tracing::info!(
-                    "split cleanup: route DELETE {} failed (may already be gone): {}",
-                    dest,
-                    String::from_utf8_lossy(&o.stderr).trim()
-                );
-            }
-            Err(e) => {
-                tracing::warn!("split cleanup: route.exe failed: {}", e);
-                break;
-            }
+            Err(e) => tracing::info!(
+                "split cleanup: delete {} failed (may already be gone): {:#}",
+                row.dest,
+                e
+            ),
         }
     }
     if removed > 0 {
@@ -487,108 +475,81 @@ async fn cleanup_stale_tunnel_routes(target: VpnTarget, bus: &StatusBus) {
     }
 }
 
-/// All (dest, gateway-str, gateway, interface-str) rows for the two
-/// full-tunnel def1 destinations from `route print -4`.
-async fn list_tunnel_routes() -> Vec<(String, String, Option<Ipv4Addr>, String)> {    let mut out = Vec::new();
-    let Ok(output) = tokio::process::Command::new("route.exe")
-        .args(["print", "-4"])
-        .output()
-        .await
-    else {
-        return out;
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 5 {
-            continue;
-        }
-        // Layout: Network Destination, Netmask, Gateway, Interface, Metric
-        let is_def1 = (parts[0] == "0.0.0.0" || parts[0] == "128.0.0.0")
-            && parts[1] == "128.0.0.0";
-        if !is_def1 {
-            continue;
-        }
-        let gw = parts[2].parse::<Ipv4Addr>().ok();
-        out.push((
-            parts[0].to_string(),
-            parts[2].to_string(),
-            gw,
-            parts[3].to_string(),
-        ));
-    }
-    out
+/// `redirect-gateway def1` installs exactly these two halves: 0.0.0.0/1 and
+/// 128.0.0.0/1. Together they capture every IPv4 destination.
+fn is_def1_row(dest: Ipv4Addr, prefix_len: u8) -> bool {
+    prefix_len == 1 && (dest == Ipv4Addr::UNSPECIFIED || dest == Ipv4Addr::new(128, 0, 0, 0))
 }
-/// /32 host rows whose gateway is our VPN gateway: server traffic pointed
-/// INTO the tunnel (circular — the link socket dies with 1232). OpenVPN
-/// never installs these (its server bypass always points at the LAN
-/// gateway); only leaks/bugs create them. Pre-filtered by gateway here;
-/// the caller re-applies the strict is_some gw-match guard.
-async fn list_circular_host_routes(
-    vpn_gw: Option<Ipv4Addr>,
-) -> Vec<(String, String, Option<Ipv4Addr>, String)> {
-    let mut out = Vec::new();
-    let Some(want) = vpn_gw else {
-        return out;
-    };
-    let Ok(output) = tokio::process::Command::new("route.exe")
-        .args(["print", "-4"])
-        .output()
-        .await
-    else {
-        return out;
-    };
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 5 {
-            continue;
-        }
-        // Layout: Network Destination, Netmask, Gateway, Interface, Metric
-        if parts[1] != "255.255.255.255" {
-            continue;
-        }
-        if parts[2].parse::<Ipv4Addr>().ok() != Some(want) {
-            continue;
-        }
-        out.push((
-            parts[0].to_string(),
-            parts[2].to_string(),
-            Some(want),
-            parts[3].to_string(),
-        ));
-    }
-    out
-}
-/// Find the VPN's peer / next-hop by scanning `route print -4` for a /32 route
-/// whose Interface column equals the VPN adapter's IP. The Gateway column on
-/// that row is the next-hop OpenVPN installed at handshake time.
-async fn find_vpn_gateway(vpn_ip: Ipv4Addr) -> Option<Ipv4Addr> {
-    let output = tokio::process::Command::new("route.exe")
-        .args(["print", "-4"])
-        .output()
-        .await
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let vpn_ip_str = vpn_ip.to_string();
 
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 5 {
-            continue;
-        }
-        // Layout: Network Destination, Netmask, Gateway, Interface, Metric
-        if parts[1] != "255.255.255.255" {
-            continue;
-        }
-        if parts[3] != vpn_ip_str {
-            continue;
-        }
-        if let Ok(gw) = parts[2].parse::<Ipv4Addr>() {
-            if !gw.is_unspecified() && gw != vpn_ip {
-                return Some(gw);
+/// Sweep def1 leftovers on VPN-candidate interfaces that are currently DOWN.
+/// A down interface carries no legitimate traffic, so any def1 row on it is an
+/// orphan from a crashed/killed run — exactly the rows that hijack IPv4 and
+/// kill OpenVPN's own link socket (`code=1232`) the moment it brings the
+/// adapter up. Conservative by construction: candidate interfaces only, only
+/// while down, only the def1 pair — our own split route (0.0.0.0/0) is never
+/// touched.
+async fn sweep_orphan_def1_routes(adapters: &[adapter::Adapter], bus: &StatusBus) {
+    let down_vpn: std::collections::HashSet<u32> = adapters
+        .iter()
+        .filter(|a| a.is_vpn_candidate() && !a.is_up)
+        .map(|a| a.if_index)
+        .collect();
+    if down_vpn.is_empty() {
+        return;
+    }
+    let rows = match forward_table::list_v4() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut removed = 0;
+    for row in rows
+        .iter()
+        .filter(|r| is_def1_row(r.dest, r.prefix_len) && down_vpn.contains(&r.if_index))
+    {
+        match forward_table::delete(row) {
+            Ok(()) => {
+                removed += 1;
+                tracing::warn!(
+                    "split cleanup: removed orphan def1 route {}/{} via {} on down VPN if{}",
+                    row.dest,
+                    row.prefix_len,
+                    row.next_hop,
+                    row.if_index
+                );
             }
+            Err(e) => tracing::info!(
+                "split cleanup: orphan delete {}/{} failed: {:#}",
+                row.dest,
+                row.prefix_len,
+                e
+            ),
         }
+    }
+    if removed > 0 {
+        bus.emit(
+            EventKind::SplitCleanup,
+            format!(
+                "split-tunnel cleanup: removed {} orphan tunnel route(s) on a down VPN interface",
+                removed
+            ),
+        );
+    }
+}
+
+/// Find the VPN's peer / next-hop: the gateway of a /32 route OpenVPN installs
+/// on the VPN interface at handshake. Identified by interface INDEX (stable,
+/// what the IP Helper API exposes) rather than the interface's IP column that
+/// `route print` shows.
+fn find_vpn_gateway(vpn_ip: Ipv4Addr, if_index: u32) -> Option<Ipv4Addr> {
+    let rows = forward_table::list_v4().ok()?;
+    for row in &rows {
+        if row.if_index != if_index || row.prefix_len != 32 {
+            continue;
+        }
+        if row.next_hop.is_unspecified() || row.next_hop == vpn_ip {
+            continue;
+        }
+        return Some(row.next_hop);
     }
     None
 }
@@ -598,4 +559,21 @@ fn unix_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_def1_row;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn def1_pair_recognized() {
+        assert!(is_def1_row(Ipv4Addr::UNSPECIFIED, 1));
+        assert!(is_def1_row(Ipv4Addr::new(128, 0, 0, 0), 1));
+        // Not the def1 magic: the default route (/0), a different /1, and the
+        // pair at the wrong prefix length.
+        assert!(!is_def1_row(Ipv4Addr::UNSPECIFIED, 0));
+        assert!(!is_def1_row(Ipv4Addr::new(64, 0, 0, 0), 1));
+        assert!(!is_def1_row(Ipv4Addr::new(128, 0, 0, 0), 2));
+    }
 }
