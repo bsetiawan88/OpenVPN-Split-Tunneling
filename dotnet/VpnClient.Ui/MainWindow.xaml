@@ -10,7 +10,8 @@
         Height="800" Width="900"
         WindowBackdropType="Mica"
         WindowCornerPreference="Round"
-        ExtendsContentIntoTitleBar="True">
+        ExtendsContentIntoTitleBar="True"
+        Icon="app-icon.png">
 
     <Grid>
         <Grid.RowDefinitions>

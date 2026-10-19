@@ -13,6 +13,7 @@
     <AssemblyVersion>1.0.0.0</AssemblyVersion>
     <FileVersion>1.0.0.0</FileVersion>
     <Version>1.0.0</Version>
+    <ApplicationIcon>app-icon.ico</ApplicationIcon>
   </PropertyGroup>
 
   <!-- Publish: produce one self-contained exe with all DLLs embedded.
@@ -35,6 +36,11 @@
 
   <ItemGroup>
     <Protobuf Include="..\..\ipc\proto\status.proto" GrpcServices="None" Link="Protos\status.proto" ProtoRoot="..\..\ipc\proto" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="app-icon.ico" />
+    <Resource Include="app-icon.png" />
   </ItemGroup>
 
 </Project>
