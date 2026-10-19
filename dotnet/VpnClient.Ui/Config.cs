@@ -18,6 +18,10 @@ public class Config
     /// <summary>Rotate interval in minutes. Clamped to 5..720 on load.</summary>
     public int RotateIntervalMinutes { get; set; } = 30;
 
+    /// <summary>Passive HTTP request log for tunneled apps (http.log, file-only).
+    /// ON creates %AppData%\VpnClient\http-log.flag which the redirector watches.</summary>
+    public bool HttpLogEnabled { get; set; } = false;
+
     [JsonIgnore]
     public static string AppDataDir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VpnClient");

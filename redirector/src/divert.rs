@@ -397,6 +397,10 @@ struct TcpFlow {
     /// while a2r==0 means the app never sent anything (app-side abort).
     a2r_bytes: u64,
     r2a_bytes: u64,
+    /// Whether the first app→remote chunk was already offered to http_log.
+    /// One-shot per flow: keeps http.log to one line per connection and
+    /// keeps the per-packet path free of parse/file cost.
+    http_logged: bool,
     /// Server→app bytes that did not fit smoltcp's window yet. Retried when
     /// can_send() reopens. Dropping these (as the old code did on partial
     /// send_slice) truncates responses mid-TLS-record: the app's TLS stack
@@ -865,6 +869,7 @@ fn handle_capture(
                     last_active: Instant::now(),
                     a2r_bytes: 0,
                     r2a_bytes: 0,
+                    http_logged: false,
                     r2a_pending: Vec::new(),
                 },
             );
@@ -1058,7 +1063,7 @@ fn service_tcp_flows(
                 } else {
                     let mut moved_bytes = 0u64;
                     if let Some(tx) = app_to_remote {
-                        let n = pump_tcp_app_to_remote(socket, tx, flow.pid, stats, &mut local_scratch);
+                        let n = pump_tcp_app_to_remote(socket, tx, flow.pid, stats, &mut local_scratch, &flow.exe, &flow.original_dst, &mut flow.http_logged);
                         moved_bytes += n;
                         flow.a2r_bytes += n;
                     }
@@ -1177,6 +1182,9 @@ fn pump_tcp_app_to_remote(
     pid: u32,
     stats: &Stats,
     scratch: &mut Vec<u8>,
+    http_exe: &str,
+    http_dst: &SocketAddr,
+    http_logged: &mut bool,
 ) -> u64 {
     let mut moved = 0u64;
     while socket.can_recv() {
@@ -1207,6 +1215,12 @@ fn pump_tcp_app_to_remote(
                 moved += n as u64;
                 stats.add_app_to_remote(n as u64);
                 stats.add_pid_out(pid, n as u64);
+                // Passive HTTP log: first chunk only, best-effort, never
+                // blocks the pump. maybe_log self-gates on the flag file.
+                if !*http_logged {
+                    *http_logged = true;
+                    crate::http_log::maybe_log(pid, http_exe, http_dst, &scratch[..n]);
+                }
             }
             Err(_) => break,
         }

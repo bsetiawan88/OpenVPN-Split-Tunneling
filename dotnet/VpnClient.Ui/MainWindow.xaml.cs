@@ -40,6 +40,7 @@ public partial class MainWindow : FluentWindow
             _config.RefreshFromDisk();
             InitRotateControls();
             InitLogFooter();
+            InitHttpLogCheck();
             _statusClient.Start();
             // Link-health watchdog tick (independent of the status pipe and
             // of any log UI — the check is throttled inside). Also supervises
@@ -545,17 +546,33 @@ public partial class MainWindow : FluentWindow
         }
     }
 
-    #region Log files (automatic — no checkbox)
+    #region Log files (automatic — HTTP log opt-in via checkbox)
 
-    // Logging is always on, straight to files (one set per app start):
-    //   activity.log  — redirector events (admissions, bridges, closes)
-    //   openvpn.log / openvpn.prev.log — current + previous openvpn run
-    // This region only shows WHERE they live and opens the folder.
+    // activity.log + openvpn.log always on, straight to files (one set per app start).
+    // http.log is opt-in via HttpLogCheck (plain HTTP METHOD host/path, HTTPS SNI only).
+    // This region shows WHERE they live, opens the folder, and syncs the checkbox.
 
     private void InitLogFooter()
     {
         LogPathText.Text = VpnConnector.RuntimeDir;
         LogPathText.ToolTip = VpnConnector.RuntimeDir;
+    }
+
+    private void InitHttpLogCheck()
+    {
+        HttpLogCheck.IsChecked = _config.HttpLogEnabled;
+        // Repair flag file if config says ON but flag was deleted manually.
+        VpnConnector.SetHttpLogEnabled(_config.HttpLogEnabled);
+    }
+
+    private void HttpLogCheck_Changed(object sender, RoutedEventArgs e)
+    {
+        _config.HttpLogEnabled = HttpLogCheck.IsChecked == true;
+        _config.Save();
+        VpnConnector.SetHttpLogEnabled(_config.HttpLogEnabled);
+        FooterText.Text = _config.HttpLogEnabled
+            ? "HTTP log on → http.log (cleared on restart)"
+            : "HTTP log off";
     }
 
     private void OpenLogFolderBtn_Click(object sender, RoutedEventArgs e)

@@ -205,7 +205,7 @@ async fn tcp_loop(
                 EventKind::BridgeOpened,
                 format!("TCP \"{}\" (pid {}) {} -> {} via VPN (wfp)", exe, pid, peer, dst),
             );
-            match tcp_relay(inbound, dst, target).await {
+            match tcp_relay(inbound, dst, target, pid, &exe).await {
                 Ok(n) => tracing::debug!("wfp tcp bridge closed: {} <-> {} ({} bytes)", peer, dst, n),
                 Err(e) => {
                     let detail = format!("TCP \"{}\" (pid {}) to {} failed: {}", exe, pid, dst, short(&e.to_string()));
@@ -221,6 +221,8 @@ pub async fn tcp_relay(
     inbound: tokio::net::TcpStream,
     dst: SocketAddr,
     target: Option<VpnTarget>,
+    pid: u32,
+    exe: &str,
 ) -> Result<u64> {
     let outbound = match target {
         Some(t) => {
@@ -245,6 +247,26 @@ pub async fn tcp_relay(
     };
     let (mut ri, mut wi) = inbound.into_split();
     let (mut ro, mut wo) = outbound.into_split();
+    // Passive HTTP log: peek the first client→server chunk before the
+    // blind copy starts. Timeout-bounded so a quiet keep-alive never stalls
+    // the relay; best-effort — logging must never break the bridge.
+    {
+        let mut first = vec![0u8; 8192];
+        // Readable without consuming the stream twice: read once, forward
+        // the bytes, then continue with the regular copy.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        match tokio::time::timeout(std::time::Duration::from_secs(5), ri.read(&mut first)).await {
+            Ok(Ok(n)) if n > 0 => {
+                crate::http_log::maybe_log(pid, exe, &dst, &first[..n]);
+                if wo.write_all(&first[..n]).await.is_err() {
+                    return Ok(n as u64);
+                }
+            }
+            // No first bytes (timeout / EOF / error): fall through to the
+            // plain bidirectional copy — nothing to log.
+            _ => {}
+        }
+    }
     let c2s = tokio::io::copy(&mut ri, &mut wo);
     let s2c = tokio::io::copy(&mut ro, &mut wi);
     let (up, down) = tokio::join!(c2s, s2c);

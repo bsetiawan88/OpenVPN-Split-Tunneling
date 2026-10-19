@@ -2,6 +2,7 @@ mod adapter;
 mod divert;
 mod forward_table;
 mod flows;
+mod http_log;
 mod nic_stats;
 mod observer;
 mod pidlookup;

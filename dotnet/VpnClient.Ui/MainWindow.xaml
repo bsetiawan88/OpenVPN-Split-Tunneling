@@ -264,6 +264,7 @@
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
@@ -272,9 +273,18 @@
                               Text="OpenVPN Split Tunneling Client"
                               Foreground="{DynamicResource TextFillColorTertiaryBrush}"
                               VerticalAlignment="Center" />
-                <!-- Logs are automatic files now (no checkbox): show where,
+                <!-- Opt-in HTTP log: plain-HTTP METHOD host/path + TLS SNI per tunneled flow, file-only http.log. -->
+                <CheckBox Grid.Column="1"
+                          x:Name="HttpLogCheck"
+                          Content="HTTP log"
+                          Checked="HttpLogCheck_Changed"
+                          Unchecked="HttpLogCheck_Changed"
+                          VerticalAlignment="Center"
+                          Margin="16,0,0,0"
+                          ToolTip="Log tunneled HTTP requests to http.log (plain HTTP: METHOD host/path; HTTPS: SNI only, no decrypt). Cleared on app restart." />
+                <!-- Logs are automatic files now (this one checkbox excepted): show where,
                      so the user can find them without asking. -->
-                <ui:TextBlock Grid.Column="1"
+                <ui:TextBlock Grid.Column="2"
                               x:Name="LogPathText"
                               Text=""
                               FontTypography="Caption"
@@ -283,12 +293,12 @@
                               HorizontalAlignment="Right"
                               Margin="12,0,8,0"
                               TextTrimming="CharacterEllipsis" />
-                <ui:Button Grid.Column="2"
+                <ui:Button Grid.Column="3"
                            x:Name="OpenLogFolderBtn"
                            Content="Logs"
                            Icon="{ui:SymbolIcon FolderOpen20}"
                            Appearance="Secondary"
-                           ToolTip="Open the log folder (activity.log + openvpn.log, one set per app start)"
+                           ToolTip="Open the log folder (activity.log + openvpn.log + http.log when enabled, one set per app start)"
                            Click="OpenLogFolderBtn_Click"
                            VerticalAlignment="Center" />
             </Grid>

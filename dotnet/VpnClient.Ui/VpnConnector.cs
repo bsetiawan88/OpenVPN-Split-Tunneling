@@ -888,6 +888,34 @@ public class VpnConnector
     /// in-app Activity panel). Cleared on every app start.</summary>
     public static string ActivityLogPath => Path.Combine(RuntimeDir, "activity.log");
 
+    /// <summary>Passive HTTP request log (one line per tunneled TCP flow).
+    /// Opt-in via checkbox; cleared on every app start like the rest.</summary>
+    public static string HttpLogPath => Path.Combine(RuntimeDir, "http.log");
+
+    /// <summary>Sentinel watched by the redirector (mirrors verbose.flag pattern).
+    /// Exists = HTTP logging on. Lives under Roaming AppData like config.json.</summary>
+    public static string HttpLogFlagPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "VpnClient", "http-log.flag");
+
+    /// <summary>Sync checkbox state to flag file. Never throws.</summary>
+    public static void SetHttpLogEnabled(bool enabled)
+    {
+        try
+        {
+            if (enabled)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(HttpLogFlagPath)!);
+                File.WriteAllText(HttpLogFlagPath, "on");
+            }
+            else if (File.Exists(HttpLogFlagPath))
+            {
+                File.Delete(HttpLogFlagPath);
+            }
+        }
+        catch { }
+    }
+
     /// <summary>
     /// Fresh logs per app start: deletes stale activity.log + openvpn.log so
     /// a saved file always belongs to exactly one session. Called once from
@@ -897,7 +925,7 @@ public class VpnConnector
     /// </summary>
     public static void ClearLogsOnAppStart()
     {
-        foreach (var path in new[] { ActivityLogPath, LogPath, Path.Combine(RuntimeDir, "openvpn.prev.log") })
+        foreach (var path in new[] { ActivityLogPath, HttpLogPath, LogPath, Path.Combine(RuntimeDir, "openvpn.prev.log") })
         {
             try
             {
